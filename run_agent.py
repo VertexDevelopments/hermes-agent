@@ -2195,6 +2195,53 @@ class AIAgent:
             "project": getattr(self, "_active_project", None),
         }
 
+    def _sync_provider_with_memory_gate(self, original_user_message: str, final_response: str) -> None:
+        """Run external memory provider ``sync_all`` + ``queue_prefetch_all``,
+        gated by the ``pre_memory_write`` plugin hook.
+
+        Extracted as a method so the gate-then-call sequence is testable in
+        isolation.  Round-9 review found that source-string assertions on
+        the inline call site were not strong proof; behaviour testing
+        requires a function entry point.
+
+        Fail-closed semantics:
+          * Helper import failure → refuse the sync.
+          * Plugin returns block → refuse the sync.
+          * Otherwise → sync_all + queue_prefetch_all both fire.
+        """
+        try:
+            from hermes_cli.plugins import get_pre_memory_write_block_message
+        except ImportError as _import_err:
+            logger.error(
+                "provider sync_all: pre_memory_write helper unavailable (%s); "
+                "REFUSING memory write fail-closed",
+                _import_err,
+            )
+            return
+
+        _sync_payload = f"{original_user_message}\n---\n{final_response}"
+        _provider_target = "external-provider"
+        if hasattr(self._memory_manager, "provider_name"):
+            try:
+                _provider_target = self._memory_manager.provider_name() or _provider_target
+            except Exception:
+                pass
+        block_reason = get_pre_memory_write_block_message(
+            action="add",
+            target=_provider_target,
+            content=_sync_payload,
+            old_text=None,
+            write_path="provider_sync",
+            session_id=getattr(self, "session_id", None),
+            skill_context=self._current_skill_context(),
+        )
+        if block_reason:
+            logger.info("provider sync_all blocked by plugin: %s", block_reason)
+            return
+
+        self._memory_manager.sync_all(original_user_message, final_response)
+        self._memory_manager.queue_prefetch_all(original_user_message)
+
     def _check_compression_model_feasibility(self) -> None:
         """Warn at session start if the auxiliary compression model's context
         window is smaller than the main model's compression threshold.
@@ -12047,49 +12094,11 @@ class AIAgent:
             self._iters_since_skill = 0
 
         # External memory provider: sync the completed turn + queue next prefetch.
-        # Use original_user_message (clean input) — user_message may contain
-        # injected skill content that bloats / breaks provider queries.
+        # Gated by pre_memory_write so plugins (e.g. maestro-memory-guard) can
+        # refuse — provider sync bypasses pre_tool_call entirely (no tool name).
         if self._memory_manager and final_response and original_user_message:
             try:
-                # pre_memory_write gate: provider sync bypasses pre_tool_call
-                # entirely (no tool name).  The combined turn payload is
-                # presented to plugins as the proposed write content.
-                # Fail-closed on import error: refuse the sync rather than
-                # silently downgrading to the bypass behaviour.
-                _provider_blocked = False
-                try:
-                    from hermes_cli.plugins import get_pre_memory_write_block_message
-                except ImportError as _import_err:
-                    logger.error(
-                        "provider sync_all: pre_memory_write helper unavailable (%s); "
-                        "REFUSING memory write fail-closed",
-                        _import_err,
-                    )
-                    _provider_blocked = True
-                else:
-                    _sync_payload = f"{original_user_message}\n---\n{final_response}"
-                    _provider_target = "external-provider"
-                    if hasattr(self._memory_manager, "provider_name"):
-                        try:
-                            _provider_target = self._memory_manager.provider_name() or _provider_target
-                        except Exception:
-                            pass
-                    block_reason = get_pre_memory_write_block_message(
-                        action="add",
-                        target=_provider_target,
-                        content=_sync_payload,
-                        old_text=None,
-                        write_path="provider_sync",
-                        session_id=getattr(self, "session_id", None),
-                        skill_context=self._current_skill_context(),
-                    )
-                    if block_reason:
-                        _provider_blocked = True
-                        logger.info("provider sync_all blocked by plugin: %s", block_reason)
-
-                if not _provider_blocked:
-                    self._memory_manager.sync_all(original_user_message, final_response)
-                    self._memory_manager.queue_prefetch_all(original_user_message)
+                self._sync_provider_with_memory_gate(original_user_message, final_response)
             except Exception:
                 pass
 

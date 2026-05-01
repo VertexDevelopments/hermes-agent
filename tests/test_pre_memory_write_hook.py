@@ -177,12 +177,14 @@ def test_flush_memories_call_site_imports_gate():
 
 
 def test_provider_sync_call_site_imports_gate():
-    """The provider sync_all gate is wired (source-level assertion)."""
+    """The provider sync_all gate is wired (source-level assertion).
+    Backed by behavioural tests below — this is a guard against silent
+    refactors that delete the gate."""
     src = open("/Users/zenflow/.hermes/hermes-agent/run_agent.py", "r", encoding="utf-8").read()
     assert 'write_path="provider_sync"' in src
-    # The sync_all guard variable name proves the gate result is consumed.
-    assert "_provider_blocked" in src
-    # Both protected paths must fail-closed on ImportError.
+    # The gate is consumed in _sync_provider_with_memory_gate.
+    assert "_sync_provider_with_memory_gate" in src
+    # Every gate call site must fail-closed on ImportError.
     assert src.count("REFUSING memory write fail-closed") >= 3
 
 
@@ -457,6 +459,74 @@ def test_flush_memories_fail_closes_on_gate_import_error(monkeypatch):
     assert memory_tool_mock.call_count == 0, (
         f"flush did not fail-closed on gate ImportError ({memory_tool_mock.call_count})"
     )
+
+
+def test_provider_sync_blocked_does_not_call_sync_all(monkeypatch):
+    """Provider sync_all path: when pre_memory_write returns a block,
+    neither sync_all nor queue_prefetch_all fire.
+
+    Closes round-9 H3: prior coverage was source-string only."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.sync_all = MagicMock()
+    agent._memory_manager.queue_prefetch_all = MagicMock()
+
+    def _block_sync(write_path, **_kw):
+        return "BLOCKED" if write_path == "provider_sync" else None
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", side_effect=_block_sync):
+        agent._sync_provider_with_memory_gate(
+            original_user_message="user said something",
+            final_response="assistant replied",
+        )
+
+    assert agent._memory_manager.sync_all.call_count == 0, "sync_all called despite block"
+    assert agent._memory_manager.queue_prefetch_all.call_count == 0, (
+        "queue_prefetch_all called despite block"
+    )
+
+
+def test_provider_sync_allowed_calls_sync_all_and_prefetch(monkeypatch):
+    """Counter-test: when gate allows, both sync_all and queue_prefetch_all fire."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", return_value=None):
+        agent._sync_provider_with_memory_gate(
+            original_user_message="user message",
+            final_response="assistant response",
+        )
+
+    assert agent._memory_manager.sync_all.call_count == 1
+    assert agent._memory_manager.queue_prefetch_all.call_count == 1
+
+
+def test_provider_sync_fail_closes_on_gate_import_error(monkeypatch):
+    """Provider sync with helper ImportError must fail-closed."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+
+    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+    def _import_blocker(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "hermes_cli.plugins" and "get_pre_memory_write_block_message" in (fromlist or ()):
+            raise ImportError("simulated version skew")
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch("builtins.__import__", side_effect=_import_blocker):
+        agent._sync_provider_with_memory_gate(
+            original_user_message="msg",
+            final_response="resp",
+        )
+
+    assert agent._memory_manager.sync_all.call_count == 0
+    assert agent._memory_manager.queue_prefetch_all.call_count == 0
 
 
 def test_helper_returns_block_with_real_message_for_sentinel():
