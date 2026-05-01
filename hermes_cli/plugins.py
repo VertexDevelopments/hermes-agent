@@ -71,6 +71,7 @@ VALID_HOOKS: Set[str] = {
     "on_session_finalize",
     "on_session_reset",
     "subagent_stop",
+    "pre_memory_write",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
@@ -1085,6 +1086,59 @@ def get_pre_tool_call_block_message(
         task_id=task_id,
         session_id=session_id,
         tool_call_id=tool_call_id,
+    )
+
+    for result in hook_results:
+        if not isinstance(result, dict):
+            continue
+        if result.get("action") != "block":
+            continue
+        message = result.get("message")
+        if isinstance(message, str) and message:
+            return message
+
+    return None
+
+
+def get_pre_memory_write_block_message(
+    *,
+    action: str,
+    target: str,
+    content: Optional[str],
+    old_text: Optional[str] = None,
+    write_path: str,
+    session_id: Optional[str] = None,
+    skill_context: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Check ``pre_memory_write`` hooks for a blocking directive.
+
+    Fires at every memory mutation point regardless of whether it is reached
+    via the tool dispatcher.  Closes the gap that ``pre_tool_call`` cannot
+    cover for ``flush_memories()`` (direct ``_memory_tool`` invocation) and
+    external memory provider ``sync_all()`` (no tool name).
+
+    Plugins return::
+
+        {"action": "block", "message": "Reason this memory write was blocked"}
+
+    to refuse the write.  Anything else allows the write to proceed.  Invalid
+    or irrelevant hook return values are silently ignored so existing
+    observer-only hooks are unaffected.
+
+    ``write_path`` is one of ``"tool" | "flush" | "provider_sync"`` and
+    indicates which call site is asking.  Plugins MAY use this to apply
+    different policy (e.g. block the flush path entirely while allowing
+    explicit tool calls).
+    """
+    hook_results = invoke_hook(
+        "pre_memory_write",
+        action=action,
+        target=target,
+        content=content,
+        old_text=old_text,
+        write_path=write_path,
+        session_id=session_id,
+        skill_context=skill_context if isinstance(skill_context, dict) else {},
     )
 
     for result in hook_results:

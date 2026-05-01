@@ -2169,6 +2169,32 @@ class AIAgent:
             "api_mode": getattr(self, "api_mode", "") or "",
         }
 
+    def _current_skill_context(self) -> Dict[str, Any]:
+        """Return the active-skill context for plugin hooks.
+
+        Used by the ``pre_memory_write`` plugin hook so plugins (e.g.
+        ``maestro-memory-guard``) can apply project-confidentiality policy
+        without re-reading the session file on every memory write.
+
+        Returns a best-effort dict with the keys plugins look up:
+            ``active_skill``: the most recently auto-loaded project skill
+                              name, or ``None``.
+            ``channel_id``:   the gateway channel id (Discord/Telegram) that
+                              triggered the skill load, or ``None``.
+            ``project``:      the resolved project tag derived from the
+                              skill, or ``None``.
+
+        This is intentionally minimal: skill resolution lives in plugins, and
+        we just expose what we know.  Plugins that need richer context can
+        still fall back to reading the session file.  Callers should treat
+        every key as optional.
+        """
+        return {
+            "active_skill": getattr(self, "_active_skill_name", None),
+            "channel_id": getattr(self, "_active_channel_id", None),
+            "project": getattr(self, "_active_project", None),
+        }
+
     def _check_compression_model_feasibility(self) -> None:
         """Warn at session start if the auxiliary compression model's context
         window is smaller than the main model's compression threshold.
@@ -7504,6 +7530,30 @@ class AIAgent:
                     try:
                         args = json.loads(tc.function.arguments)
                         flush_target = args.get("target", "memory")
+
+                        # pre_memory_write gate: this path bypasses pre_tool_call
+                        # because _memory_tool is called directly, not via the
+                        # main dispatcher.  Plugins (e.g. maestro-memory-guard)
+                        # can refuse the write here.
+                        try:
+                            from hermes_cli.plugins import get_pre_memory_write_block_message
+                            block_reason = get_pre_memory_write_block_message(
+                                action=args.get("action"),
+                                target=flush_target,
+                                content=args.get("content"),
+                                old_text=args.get("old_text"),
+                                write_path="flush",
+                                session_id=getattr(self, "session_id", None),
+                                skill_context=self._current_skill_context(),
+                            )
+                            if block_reason:
+                                logger.info("flush_memories blocked by plugin: %s", block_reason)
+                                if not self.quiet_mode:
+                                    print(f"  🧠 Memory flush: BLOCKED ({block_reason})")
+                                continue
+                        except ImportError:
+                            pass
+
                         from tools.memory_tool import memory_tool as _memory_tool
                         _memory_tool(
                             action=args.get("action"),
@@ -11899,8 +11949,37 @@ class AIAgent:
         # injected skill content that bloats / breaks provider queries.
         if self._memory_manager and final_response and original_user_message:
             try:
-                self._memory_manager.sync_all(original_user_message, final_response)
-                self._memory_manager.queue_prefetch_all(original_user_message)
+                # pre_memory_write gate: provider sync bypasses pre_tool_call
+                # entirely (no tool name).  The combined turn payload is
+                # presented to plugins as the proposed write content.
+                _provider_blocked = False
+                try:
+                    from hermes_cli.plugins import get_pre_memory_write_block_message
+                    _sync_payload = f"{original_user_message}\n---\n{final_response}"
+                    _provider_target = "external-provider"
+                    if hasattr(self._memory_manager, "provider_name"):
+                        try:
+                            _provider_target = self._memory_manager.provider_name() or _provider_target
+                        except Exception:
+                            pass
+                    block_reason = get_pre_memory_write_block_message(
+                        action="add",
+                        target=_provider_target,
+                        content=_sync_payload,
+                        old_text=None,
+                        write_path="provider_sync",
+                        session_id=getattr(self, "session_id", None),
+                        skill_context=self._current_skill_context(),
+                    )
+                    if block_reason:
+                        _provider_blocked = True
+                        logger.info("provider sync_all blocked by plugin: %s", block_reason)
+                except ImportError:
+                    pass
+
+                if not _provider_blocked:
+                    self._memory_manager.sync_all(original_user_message, final_response)
+                    self._memory_manager.queue_prefetch_all(original_user_message)
             except Exception:
                 pass
 
