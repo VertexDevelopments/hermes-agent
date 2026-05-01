@@ -6,6 +6,7 @@ and implement the required methods.
 """
 
 import asyncio
+import contextlib
 import inspect
 import ipaddress
 import logging
@@ -927,6 +928,12 @@ class BasePlatformAdapter(ABC):
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
+        # Per-chat chat-action override stack (e.g. "record_voice" while
+        # transcribing a voice memo). ``_keep_typing`` reads the top of the
+        # stack each iteration so a caller can flip the indicator mid-flight
+        # and revert on exit. Use ``_typing_action_scope()`` as a context
+        # manager rather than poking this dict directly.
+        self._typing_action_overrides: Dict[str, list[str]] = {}
 
     @property
     def has_fatal_error(self) -> bool:
@@ -1127,12 +1134,16 @@ class BasePlatformAdapter(ABC):
         """
         return SendResult(success=False, error="Not supported")
 
-    async def send_typing(self, chat_id: str, metadata=None) -> None:
+    async def send_typing(self, chat_id: str, metadata=None, action: str = "typing") -> None:
         """
         Send a typing indicator.
-        
+
         Override in subclasses if the platform supports it.
         metadata: optional dict with platform-specific context (e.g. thread_id for Slack).
+        action:   chat-action key. Defaults to ``"typing"`` for backwards
+                  compatibility. Telegram-specific values like ``"record_voice"``
+                  are forwarded to the underlying client when the platform
+                  supports them; other adapters can ignore the parameter.
         """
         pass
 
@@ -1443,24 +1454,43 @@ class BasePlatformAdapter(ABC):
         interval: float = 2.0,
         metadata=None,
         stop_event: asyncio.Event | None = None,
+        action: str = "typing",
     ) -> None:
         """
         Continuously send typing indicator until cancelled.
-        
+
         Telegram/Discord typing status expires after ~5 seconds, so we refresh every 2
         to recover quickly after progress messages interrupt it.
-        
+
         Skips send_typing when the chat is in ``_typing_paused`` (e.g. while
         the agent is waiting for dangerous-command approval).  This is critical
         for Slack's Assistant API where ``assistant_threads_setStatus`` disables
         the compose box — pausing lets the user type ``/approve`` or ``/deny``.
+
+        ``action`` is the default chat-action sent each tick. If a caller has
+        pushed an entry into ``_typing_action_overrides[chat_id]`` (via
+        ``_typing_action_scope``), the top of that stack wins — letting a
+        long-running step (e.g. voice transcription) flip the indicator to
+        ``"record_voice"`` mid-flight without restarting the loop.
         """
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
                     return
                 if chat_id not in self._typing_paused:
-                    await self.send_typing(chat_id, metadata=metadata)
+                    _stack = self._typing_action_overrides.get(chat_id)
+                    _effective_action = _stack[-1] if _stack else action
+                    # Older adapter overrides don't accept ``action``; pass it
+                    # only when the concrete ``send_typing`` signature exposes
+                    # the parameter.
+                    if self._send_typing_accepts_action():
+                        await self.send_typing(
+                            chat_id,
+                            metadata=metadata,
+                            action=_effective_action,
+                        )
+                    else:
+                        await self.send_typing(chat_id, metadata=metadata)
                 if stop_event is None:
                     await asyncio.sleep(interval)
                     continue
@@ -1482,6 +1512,58 @@ class BasePlatformAdapter(ABC):
                 except Exception:
                     pass
             self._typing_paused.discard(chat_id)
+
+    def _send_typing_accepts_action(self) -> bool:
+        """True iff this adapter's ``send_typing`` accepts an ``action`` kwarg.
+
+        Cached per-class so the inspect call only happens once. Most adapters
+        don't override ``action`` (the parameter only matters for Telegram's
+        chat-action variants like ``"record_voice"``); detecting at runtime
+        keeps third-party adapters compatible without forcing every override
+        to update its signature.
+        """
+        cls = type(self)
+        cached = getattr(cls, "_send_typing_action_supported", None)
+        if cached is not None:
+            return cached
+        try:
+            sig = inspect.signature(cls.send_typing)
+            params = sig.parameters
+            supported = (
+                "action" in params
+                or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+            )
+        except (TypeError, ValueError):
+            supported = False
+        cls._send_typing_action_supported = supported
+        return supported
+
+    @contextlib.asynccontextmanager
+    async def _typing_action_scope(self, chat_id: str, action: str):
+        """Push ``action`` onto the chat's typing-action stack for the block.
+
+        ``_keep_typing`` reads the top of the stack each iteration, so wrapping
+        a long-running step (e.g. voice transcription) in this scope flips the
+        platform indicator without restarting the loop. Exit pops the entry,
+        even if the body raises, restoring whatever indicator was active before.
+
+        Example::
+
+            async with adapter._typing_action_scope(chat_id, "record_voice"):
+                transcript = await transcribe(audio)
+            # _keep_typing resumes sending "typing" automatically.
+        """
+        stack = self._typing_action_overrides.setdefault(chat_id, [])
+        stack.append(action)
+        try:
+            yield
+        finally:
+            try:
+                stack.remove(action)
+            except ValueError:
+                pass
+            if not stack:
+                self._typing_action_overrides.pop(chat_id, None)
 
     def pause_typing_for_chat(self, chat_id: str) -> None:
         """Pause typing indicator for a chat (e.g. during approval waits).

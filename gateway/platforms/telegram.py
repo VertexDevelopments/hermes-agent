@@ -1966,8 +1966,21 @@ class TelegramAdapter(BasePlatformAdapter):
             # Fallback: try as a regular photo
             return await self.send_image(chat_id, animation_url, caption, reply_to)
 
-    async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-        """Send typing indicator."""
+    async def send_typing(
+        self,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        action: str = "typing",
+    ) -> None:
+        """Send typing-style chat action.
+
+        ``action`` defaults to ``"typing"`` for backwards compatibility; pass
+        ``"record_voice"`` while transcribing a voice memo so the user sees
+        the microphone indicator instead of the generic typing dots. Telegram
+        decays chat-actions server-side after ~5s, so callers should keep
+        firing this on the cadence of ``_keep_typing`` (every ~2s) for
+        continuous feedback during long-running work.
+        """
         if self._bot:
             try:
                 _typing_thread = self._metadata_thread_id(metadata)
@@ -1975,14 +1988,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 try:
                     await self._bot.send_chat_action(
                         chat_id=int(chat_id),
-                        action="typing",
+                        action=action,
                         message_thread_id=message_thread_id,
                     )
                 except Exception as e:
                     if message_thread_id is not None and self._is_thread_not_found_error(e):
                         await self._bot.send_chat_action(
                             chat_id=int(chat_id),
-                            action="typing",
+                            action=action,
                             message_thread_id=None,
                         )
                     else:

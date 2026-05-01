@@ -3924,10 +3924,25 @@ class GatewayRunner:
                 )
 
             if audio_paths:
-                message_text = await self._enrich_message_with_transcription(
-                    message_text,
-                    audio_paths,
-                )
+                # Flip the platform indicator from "typing" to "record_voice"
+                # while STT is running so the user sees the microphone glyph
+                # for the (potentially multi-second) transcription, then
+                # falls back to "typing" automatically when the LLM call
+                # picks up. Adapters that don't implement the scope context
+                # (or that don't support chat-actions) silently no-op.
+                _stt_adapter = self.adapters.get(source.platform)
+                _stt_scope = getattr(_stt_adapter, "_typing_action_scope", None)
+                if _stt_scope is not None:
+                    async with _stt_scope(source.chat_id, "record_voice"):
+                        message_text = await self._enrich_message_with_transcription(
+                            message_text,
+                            audio_paths,
+                        )
+                else:
+                    message_text = await self._enrich_message_with_transcription(
+                        message_text,
+                        audio_paths,
+                    )
                 _stt_fail_markers = (
                     "No STT provider",
                     "STT is disabled",
