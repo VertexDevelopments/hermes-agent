@@ -7534,25 +7534,34 @@ class AIAgent:
                         # pre_memory_write gate: this path bypasses pre_tool_call
                         # because _memory_tool is called directly, not via the
                         # main dispatcher.  Plugins (e.g. maestro-memory-guard)
-                        # can refuse the write here.
+                        # can refuse the write here.  Fail-closed on import
+                        # error: this is a security gate, never silently
+                        # downgrade to the bypass behaviour.
                         try:
                             from hermes_cli.plugins import get_pre_memory_write_block_message
-                            block_reason = get_pre_memory_write_block_message(
-                                action=args.get("action"),
-                                target=flush_target,
-                                content=args.get("content"),
-                                old_text=args.get("old_text"),
-                                write_path="flush",
-                                session_id=getattr(self, "session_id", None),
-                                skill_context=self._current_skill_context(),
+                        except ImportError as _import_err:
+                            logger.error(
+                                "flush_memories: pre_memory_write helper unavailable (%s); "
+                                "REFUSING memory write fail-closed",
+                                _import_err,
                             )
-                            if block_reason:
-                                logger.info("flush_memories blocked by plugin: %s", block_reason)
-                                if not self.quiet_mode:
-                                    print(f"  🧠 Memory flush: BLOCKED ({block_reason})")
-                                continue
-                        except ImportError:
-                            pass
+                            if not self.quiet_mode:
+                                print("  🧠 Memory flush: BLOCKED (hook helper unavailable)")
+                            continue
+                        block_reason = get_pre_memory_write_block_message(
+                            action=args.get("action"),
+                            target=flush_target,
+                            content=args.get("content"),
+                            old_text=args.get("old_text"),
+                            write_path="flush",
+                            session_id=getattr(self, "session_id", None),
+                            skill_context=self._current_skill_context(),
+                        )
+                        if block_reason:
+                            logger.info("flush_memories blocked by plugin: %s", block_reason)
+                            if not self.quiet_mode:
+                                print(f"  🧠 Memory flush: BLOCKED ({block_reason})")
+                            continue
 
                         from tools.memory_tool import memory_tool as _memory_tool
                         _memory_tool(
@@ -7762,24 +7771,74 @@ class AIAgent:
             )
         elif function_name == "memory":
             target = function_args.get("target", "memory")
+            action = function_args.get("action")
+            # pre_memory_write gate: pre_tool_call already checked policy that
+            # cares about tool semantics (D-013), but pre_memory_write also
+            # covers content-based policies (D-018 Self Digest containment)
+            # that pre_tool_call deliberately doesn't.  Fail-closed on import
+            # error.
+            if action in ("add", "replace"):
+                try:
+                    from hermes_cli.plugins import get_pre_memory_write_block_message
+                except ImportError as _import_err:
+                    logger.error(
+                        "memory tool: pre_memory_write helper unavailable (%s); "
+                        "REFUSING memory write fail-closed",
+                        _import_err,
+                    )
+                    return json.dumps({"error": "memory write blocked: hook helper unavailable"}, ensure_ascii=False)
+                block_reason = get_pre_memory_write_block_message(
+                    action=action,
+                    target=target,
+                    content=function_args.get("content"),
+                    old_text=function_args.get("old_text"),
+                    write_path="tool",
+                    session_id=getattr(self, "session_id", None),
+                    skill_context=self._current_skill_context(),
+                )
+                if block_reason:
+                    logger.info("memory tool blocked by plugin: %s", block_reason)
+                    return json.dumps({"error": block_reason}, ensure_ascii=False)
             from tools.memory_tool import memory_tool as _memory_tool
             result = _memory_tool(
-                action=function_args.get("action"),
+                action=action,
                 target=target,
                 content=function_args.get("content"),
                 old_text=function_args.get("old_text"),
                 store=self._memory_store,
             )
-            # Bridge: notify external memory provider of built-in memory writes
-            if self._memory_manager and function_args.get("action") in ("add", "replace"):
+            # Bridge: notify external memory provider of built-in memory writes.
+            # Same gate applies: a plugin that blocks the primary write should
+            # also block the bridge.  Re-using the same block reason check is
+            # cheap because the helper is local.
+            if self._memory_manager and action in ("add", "replace"):
+                # Re-check for the bridge call site so a hook that wants to
+                # allow primary but block bridge (or vice-versa) can.
                 try:
-                    self._memory_manager.on_memory_write(
-                        function_args.get("action", ""),
-                        target,
-                        function_args.get("content", ""),
+                    from hermes_cli.plugins import get_pre_memory_write_block_message as _gate
+                    bridge_block = _gate(
+                        action=action,
+                        target="external-provider-bridge",
+                        content=function_args.get("content", ""),
+                        old_text=None,
+                        write_path="provider_sync",
+                        session_id=getattr(self, "session_id", None),
+                        skill_context=self._current_skill_context(),
                     )
-                except Exception:
-                    pass
+                    if bridge_block:
+                        logger.info("memory bridge blocked by plugin: %s", bridge_block)
+                    else:
+                        try:
+                            self._memory_manager.on_memory_write(
+                                action,
+                                target,
+                                function_args.get("content", ""),
+                            )
+                        except Exception:
+                            pass
+                except ImportError:
+                    # Fail-closed: do not call the bridge if the gate is missing.
+                    logger.error("memory bridge: pre_memory_write helper unavailable; bridge skipped")
             return result
         elif self._memory_manager and self._memory_manager.has_tool(function_name):
             return self._memory_manager.handle_tool_call(function_name, function_args)
@@ -8273,24 +8332,67 @@ class AIAgent:
                     self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
             elif function_name == "memory":
                 target = function_args.get("target", "memory")
-                from tools.memory_tool import memory_tool as _memory_tool
-                function_result = _memory_tool(
-                    action=function_args.get("action"),
-                    target=target,
-                    content=function_args.get("content"),
-                    old_text=function_args.get("old_text"),
-                    store=self._memory_store,
-                )
-                # Bridge: notify external memory provider of built-in memory writes
-                if self._memory_manager and function_args.get("action") in ("add", "replace"):
+                action = function_args.get("action")
+                # pre_memory_write gate (D-018 content policy).  Fail-closed
+                # on import error.
+                _gate_blocked = None
+                if action in ("add", "replace"):
                     try:
-                        self._memory_manager.on_memory_write(
-                            function_args.get("action", ""),
-                            target,
-                            function_args.get("content", ""),
+                        from hermes_cli.plugins import get_pre_memory_write_block_message
+                    except ImportError as _import_err:
+                        logger.error(
+                            "memory tool (alt path): pre_memory_write helper "
+                            "unavailable (%s); REFUSING memory write fail-closed",
+                            _import_err,
                         )
-                    except Exception:
-                        pass
+                        _gate_blocked = "memory write blocked: hook helper unavailable"
+                    else:
+                        _gate_blocked = get_pre_memory_write_block_message(
+                            action=action,
+                            target=target,
+                            content=function_args.get("content"),
+                            old_text=function_args.get("old_text"),
+                            write_path="tool",
+                            session_id=getattr(self, "session_id", None),
+                            skill_context=self._current_skill_context(),
+                        )
+                if _gate_blocked:
+                    function_result = json.dumps({"error": _gate_blocked}, ensure_ascii=False)
+                else:
+                    from tools.memory_tool import memory_tool as _memory_tool
+                    function_result = _memory_tool(
+                        action=action,
+                        target=target,
+                        content=function_args.get("content"),
+                        old_text=function_args.get("old_text"),
+                        store=self._memory_store,
+                    )
+                    # Bridge: notify external memory provider of built-in memory writes.
+                    if self._memory_manager and action in ("add", "replace"):
+                        try:
+                            from hermes_cli.plugins import get_pre_memory_write_block_message as _gate
+                            bridge_block = _gate(
+                                action=action,
+                                target="external-provider-bridge",
+                                content=function_args.get("content", ""),
+                                old_text=None,
+                                write_path="provider_sync",
+                                session_id=getattr(self, "session_id", None),
+                                skill_context=self._current_skill_context(),
+                            )
+                            if bridge_block:
+                                logger.info("memory bridge (alt path) blocked: %s", bridge_block)
+                            else:
+                                try:
+                                    self._memory_manager.on_memory_write(
+                                        action,
+                                        target,
+                                        function_args.get("content", ""),
+                                    )
+                                except Exception:
+                                    pass
+                        except ImportError:
+                            logger.error("memory bridge (alt path): hook unavailable; bridge skipped")
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
@@ -11952,9 +12054,19 @@ class AIAgent:
                 # pre_memory_write gate: provider sync bypasses pre_tool_call
                 # entirely (no tool name).  The combined turn payload is
                 # presented to plugins as the proposed write content.
+                # Fail-closed on import error: refuse the sync rather than
+                # silently downgrading to the bypass behaviour.
                 _provider_blocked = False
                 try:
                     from hermes_cli.plugins import get_pre_memory_write_block_message
+                except ImportError as _import_err:
+                    logger.error(
+                        "provider sync_all: pre_memory_write helper unavailable (%s); "
+                        "REFUSING memory write fail-closed",
+                        _import_err,
+                    )
+                    _provider_blocked = True
+                else:
                     _sync_payload = f"{original_user_message}\n---\n{final_response}"
                     _provider_target = "external-provider"
                     if hasattr(self._memory_manager, "provider_name"):
@@ -11974,8 +12086,6 @@ class AIAgent:
                     if block_reason:
                         _provider_blocked = True
                         logger.info("provider sync_all blocked by plugin: %s", block_reason)
-                except ImportError:
-                    pass
 
                 if not _provider_blocked:
                     self._memory_manager.sync_all(original_user_message, final_response)
