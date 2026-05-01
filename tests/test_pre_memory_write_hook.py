@@ -325,6 +325,125 @@ def test_flush_memories_invokes_memory_tool_when_not_blocked(monkeypatch):
     )
 
 
+def test_invoke_tool_memory_blocked_does_not_call_memory_tool(monkeypatch):
+    """Dispatcher path (_invoke_tool, function_name == 'memory'): when
+    pre_memory_write returns a block, _memory_tool MUST NOT be called.
+
+    Closes round-8 H3: prior tests only proved the flush path."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    memory_tool_mock = MagicMock(return_value="should_not_be_called")
+    bridge_mock = MagicMock()
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.on_memory_write = bridge_mock
+
+    def _block_tool(write_path, **_kw):
+        return "BLOCKED" if write_path == "tool" else None
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", side_effect=_block_tool):
+        with patch("tools.memory_tool.memory_tool", memory_tool_mock):
+            result = agent._invoke_tool(
+                "memory",
+                {"action": "add", "target": "memory", "content": "secret"},
+                effective_task_id="task-1",
+            )
+
+    import json as _json
+    parsed = _json.loads(result)
+    assert "error" in parsed, f"expected error response, got {parsed}"
+    assert memory_tool_mock.call_count == 0, (
+        f"_invoke_tool ran memory_tool despite block ({memory_tool_mock.call_count})"
+    )
+    assert bridge_mock.call_count == 0, (
+        f"_invoke_tool ran bridge despite block ({bridge_mock.call_count})"
+    )
+
+
+def test_invoke_tool_memory_allowed_runs_memory_tool_and_bridge(monkeypatch):
+    """Paired counter-test: when gate allows, _memory_tool AND the
+    external-provider bridge fire."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    memory_tool_mock = MagicMock(return_value="saved")
+    bridge_mock = MagicMock()
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.on_memory_write = bridge_mock
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", return_value=None):
+        with patch("tools.memory_tool.memory_tool", memory_tool_mock):
+            agent._invoke_tool(
+                "memory",
+                {"action": "add", "target": "memory", "content": "innocent fact"},
+                effective_task_id="task-2",
+            )
+
+    assert memory_tool_mock.call_count == 1
+    assert bridge_mock.call_count == 1, (
+        "bridge must fire when both primary gate and bridge gate allow"
+    )
+
+
+def test_invoke_tool_memory_bridge_blocked_runs_primary_only(monkeypatch):
+    """Per-call-site policy: gate may allow primary write but block bridge.
+    Tests that the bridge gate is independent and respected."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    memory_tool_mock = MagicMock(return_value="saved")
+    bridge_mock = MagicMock()
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.on_memory_write = bridge_mock
+
+    def _allow_tool_block_bridge(write_path, **_kw):
+        if write_path == "provider_sync":
+            return "BLOCKED bridge"
+        return None  # tool allowed
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", side_effect=_allow_tool_block_bridge):
+        with patch("tools.memory_tool.memory_tool", memory_tool_mock):
+            agent._invoke_tool(
+                "memory",
+                {"action": "add", "target": "memory", "content": "fact"},
+                effective_task_id="task-3",
+            )
+
+    assert memory_tool_mock.call_count == 1, "primary write should have fired"
+    assert bridge_mock.call_count == 0, (
+        f"bridge fired despite block ({bridge_mock.call_count})"
+    )
+
+
+def test_invoke_tool_memory_fail_closes_on_gate_import_error(monkeypatch):
+    """Dispatcher path with helper ImportError must fail closed."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    memory_tool_mock = MagicMock(return_value="should_not_be_called")
+    agent._memory_manager = MagicMock()
+
+    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+    def _import_blocker(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "hermes_cli.plugins" and "get_pre_memory_write_block_message" in (fromlist or ()):
+            raise ImportError("simulated version skew")
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch("builtins.__import__", side_effect=_import_blocker):
+        with patch("tools.memory_tool.memory_tool", memory_tool_mock):
+            result = agent._invoke_tool(
+                "memory",
+                {"action": "add", "target": "memory", "content": "any"},
+                effective_task_id="task-4",
+            )
+
+    import json as _json
+    parsed = _json.loads(result)
+    assert "error" in parsed
+    assert memory_tool_mock.call_count == 0
+
+
 def test_flush_memories_fail_closes_on_gate_import_error(monkeypatch):
     """When the gate helper raises ImportError, flush must NOT call
     memory_tool — fail-closed for security."""
