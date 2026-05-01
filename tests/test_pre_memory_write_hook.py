@@ -196,6 +196,150 @@ def test_main_memory_tool_dispatcher_gates_writes():
     assert src.count('write_path="tool"') >= 2
 
 
+# -----------------------------------------------------------------------------
+# Behavioural test fixture — minimal AIAgent + transport mock so flush_memories
+# reaches its memory tool dispatch without a live LLM provider.
+# -----------------------------------------------------------------------------
+
+
+def _build_test_agent(monkeypatch):
+    """Stand up a minimal AIAgent with the memory tool wired through and a
+    fake transport that returns a chosen tool-call payload."""
+    import sys
+    import types
+    from unittest.mock import MagicMock
+
+    sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
+    sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
+    sys.modules.setdefault("fal_client", types.SimpleNamespace())
+
+    import run_agent
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs): pass
+        def close(self): pass
+
+    monkeypatch.setattr(run_agent, "get_tool_definitions", lambda **kw: [
+        {"type": "function", "function": {
+            "name": "memory", "description": "memory tool",
+            "parameters": {"type": "object", "properties": {}},
+        }},
+    ])
+    monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda: {})
+    monkeypatch.setattr(run_agent, "OpenAI", _FakeOpenAI)
+
+    agent = run_agent.AIAgent(
+        api_key="test-key",
+        base_url="https://test.example.com/v1",
+        provider="openrouter",
+        api_mode="chat_completions",
+        max_iterations=4,
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._memory_store = MagicMock()
+    agent._memory_flush_min_turns = 1
+    agent._user_turn_count = 5
+    return agent, run_agent
+
+
+def _wire_flush_response(agent, monkeypatch, content):
+    """Patch the agent's transport to surface a memory tool call carrying
+    ``content`` to the flush dispatch.  Returns the call_llm response stub."""
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    flush_args = json.dumps({
+        "action": "add", "target": "memory", "content": content,
+    })
+    fake_normalized = SimpleNamespace(
+        tool_calls=[SimpleNamespace(function=SimpleNamespace(name="memory", arguments=flush_args))],
+    )
+    fake_transport = MagicMock()
+    fake_transport.normalize_response.return_value = fake_normalized
+    monkeypatch.setattr(agent, "_get_transport", lambda: fake_transport)
+
+    return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=100, completion_tokens=20, total_tokens=120))
+
+
+def _run_flush_with_mocks(agent, response_stub, gate_side_effect, memory_tool_mock):
+    """Drive ``flush_memories`` with the given gate behaviour and memory-tool
+    mock.  ``gate_side_effect`` may be a callable, an exception type, or a
+    return value."""
+    from unittest.mock import patch
+    from unittest.mock import MagicMock
+
+    if isinstance(gate_side_effect, type) and issubclass(gate_side_effect, BaseException):
+        gate_patch_kwargs = {"side_effect": gate_side_effect}
+    elif callable(gate_side_effect):
+        gate_patch_kwargs = {"side_effect": gate_side_effect}
+    else:
+        gate_patch_kwargs = {"return_value": gate_side_effect}
+
+    with patch("agent.auxiliary_client.call_llm", return_value=response_stub):
+        with patch("hermes_cli.plugins.get_pre_memory_write_block_message", **gate_patch_kwargs):
+            with patch("tools.memory_tool.memory_tool", memory_tool_mock):
+                agent.flush_memories([
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi"},
+                    {"role": "user", "content": "Note"},
+                ])
+
+
+def test_flush_memories_does_not_invoke_memory_tool_when_blocked(monkeypatch):
+    """When pre_memory_write returns a block, flush MUST NOT call memory_tool.
+    This is the behavioural assertion round-7 demanded — source inspection
+    alone cannot prove the gate runs before the write."""
+    from unittest.mock import MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    response_stub = _wire_flush_response(
+        agent, monkeypatch,
+        "secret: <!-- self-digest-do-not-flush --> blocked content <!-- /self-digest-do-not-flush -->",
+    )
+    memory_tool_mock = MagicMock(return_value="should_not_be_called")
+
+    def _block(write_path, **_kw):
+        return "BLOCKED: D-018 self-digest" if write_path == "flush" else None
+
+    _run_flush_with_mocks(agent, response_stub, _block, memory_tool_mock)
+    assert memory_tool_mock.call_count == 0, (
+        f"gate-blocked flush still called memory_tool ({memory_tool_mock.call_count})"
+    )
+
+
+def test_flush_memories_invokes_memory_tool_when_not_blocked(monkeypatch):
+    """Paired with the above: when the gate allows, the write proceeds.
+    Without this, the blocked test could pass by accident if flush is broken."""
+    from unittest.mock import MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    response_stub = _wire_flush_response(agent, monkeypatch, "innocent fact")
+    memory_tool_mock = MagicMock(return_value="saved")
+
+    _run_flush_with_mocks(agent, response_stub, None, memory_tool_mock)
+    assert memory_tool_mock.call_count == 1, (
+        f"gate-allowed flush did not call memory_tool ({memory_tool_mock.call_count})"
+    )
+
+
+def test_flush_memories_fail_closes_on_gate_import_error(monkeypatch):
+    """When the gate helper raises ImportError, flush must NOT call
+    memory_tool — fail-closed for security."""
+    from unittest.mock import MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    response_stub = _wire_flush_response(agent, monkeypatch, "any payload")
+    memory_tool_mock = MagicMock(return_value="should_not_be_called")
+
+    _run_flush_with_mocks(agent, response_stub, ImportError, memory_tool_mock)
+    assert memory_tool_mock.call_count == 0, (
+        f"flush did not fail-closed on gate ImportError ({memory_tool_mock.call_count})"
+    )
+
+
 def test_helper_returns_block_with_real_message_for_sentinel():
     """End-to-end via the actual plugin manager: a write containing the
     Self-Digest sentinel is blocked.
