@@ -678,7 +678,10 @@ def test_gateway_wires_apply_skill_context_per_turn():
     legs the gate hooks would still see None.  Backed by per-attribute
     behavioural tests above; this ensures the wiring is not silently deleted
     in a future refactor."""
-    src = open("/Users/zenflow/.hermes/hermes-agent/gateway/run.py", "r", encoding="utf-8").read()
+    from pathlib import Path
+    src = (
+        Path(__file__).resolve().parents[1] / "gateway" / "run.py"
+    ).read_text(encoding="utf-8")
     # Storage initialised in __init__.
     assert "self._session_skill_context" in src, (
         "gateway must own _session_skill_context dict (codex round-10 finding #1)"
@@ -690,6 +693,30 @@ def test_gateway_wires_apply_skill_context_per_turn():
     assert "agent.apply_skill_context" in src
     # Cleared on session reset so a new session starts clean.
     assert "_skill_ctx_dict.pop(session_key" in src
+
+
+def test_gateway_does_not_reintroduce_transcript_regex_recovery():
+    """OQ-28 / D-013 round-5 regression guard.
+
+    Round-3 H2 introduced ``_recover_slash_skill_from_history`` and
+    ``_SLASH_SKILL_MARKER_RE`` to recover slash-skill activation from
+    transcript text.  Codex round-4 review (conf 0.87) rejected that
+    approach as spoofable (user-controllable text → forged
+    active_project) AND lossy under gateway compression.  Reverted in
+    fork commit 864bf1fb2 and replaced by durable persistence to
+    ~/.hermes/state/gateway_sessions.db (gateway/skill_state_db.py).
+
+    This guard ensures neither the helper name nor the regex name can
+    silently sneak back into gateway/run.py without an explicit test
+    update.  The behavioural cover for the new approach lives in
+    tests/test_gateway_skill_state.py.
+    """
+    from pathlib import Path
+    src = (
+        Path(__file__).resolve().parents[1] / "gateway" / "run.py"
+    ).read_text(encoding="utf-8")
+    assert "_recover_slash_skill_from_history" not in src
+    assert "_SLASH_SKILL_MARKER_RE" not in src
 
 
 def test_pre_memory_write_hook_skill_context_propagates_to_provider_tools(monkeypatch):
