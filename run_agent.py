@@ -7823,8 +7823,9 @@ class AIAgent:
             # cares about tool semantics (D-013), but pre_memory_write also
             # covers content-based policies (D-018 Self Digest containment)
             # that pre_tool_call deliberately doesn't.  Fail-closed on import
-            # error.
-            if action in ("add", "replace"):
+            # error.  ``remove`` is included (codex round-10 finding #2) so a
+            # plugin can block deletions of confidential session memories.
+            if action in ("add", "replace", "remove"):
                 try:
                     from hermes_cli.plugins import get_pre_memory_write_block_message
                 except ImportError as _import_err:
@@ -7858,7 +7859,7 @@ class AIAgent:
             # Same gate applies: a plugin that blocks the primary write should
             # also block the bridge.  Re-using the same block reason check is
             # cheap because the helper is local.
-            if self._memory_manager and action in ("add", "replace"):
+            if self._memory_manager and action in ("add", "replace", "remove"):
                 # Re-check for the bridge call site so a hook that wants to
                 # allow primary but block bridge (or vice-versa) can.
                 try:
@@ -8381,9 +8382,11 @@ class AIAgent:
                 target = function_args.get("target", "memory")
                 action = function_args.get("action")
                 # pre_memory_write gate (D-018 content policy).  Fail-closed
-                # on import error.
+                # on import error.  ``remove`` included (codex round-10
+                # finding #2): plugins must be able to block deletion of
+                # confidential session memories, not just additions.
                 _gate_blocked = None
-                if action in ("add", "replace"):
+                if action in ("add", "replace", "remove"):
                     try:
                         from hermes_cli.plugins import get_pre_memory_write_block_message
                     except ImportError as _import_err:
@@ -8415,7 +8418,7 @@ class AIAgent:
                         store=self._memory_store,
                     )
                     # Bridge: notify external memory provider of built-in memory writes.
-                    if self._memory_manager and action in ("add", "replace"):
+                    if self._memory_manager and action in ("add", "replace", "remove"):
                         try:
                             from hermes_cli.plugins import get_pre_memory_write_block_message as _gate
                             bridge_block = _gate(

@@ -601,6 +601,85 @@ def test_helper_blocks_when_hook_callback_raises():
     )
 
 
+# -----------------------------------------------------------------------------
+# Codex finding #2 (HIGH): memory `remove` action bypasses the write gate.
+# Both dispatcher paths (_invoke_tool primary + alt sequential) only ran the
+# gate for action in ("add", "replace").  A plugin that needed to block
+# deletions (e.g. confidential session memories) couldn't.
+# -----------------------------------------------------------------------------
+
+
+def test_invoke_tool_memory_remove_blocked_does_not_call_memory_tool(monkeypatch):
+    """Dispatcher path with action=remove must run the gate.  When the gate
+    blocks, _memory_tool MUST NOT be called."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    memory_tool_mock = MagicMock(return_value="should_not_be_called")
+    agent._memory_manager = MagicMock()
+
+    captured = {}
+
+    def _block_remove(write_path, action, **kwargs):
+        captured["action"] = action
+        captured["old_text"] = kwargs.get("old_text")
+        captured["content"] = kwargs.get("content")
+        return "BLOCKED remove" if action == "remove" else None
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", side_effect=_block_remove):
+        with patch("tools.memory_tool.memory_tool", memory_tool_mock):
+            result = agent._invoke_tool(
+                "memory",
+                {"action": "remove", "target": "memory", "old_text": "secret line"},
+                effective_task_id="task-rm-1",
+            )
+
+    import json as _json
+    parsed = _json.loads(result)
+    assert "error" in parsed, f"expected error response, got {parsed}"
+    assert memory_tool_mock.call_count == 0, (
+        f"_invoke_tool ran memory_tool despite remove block ({memory_tool_mock.call_count})"
+    )
+    assert captured.get("action") == "remove"
+    assert captured.get("old_text") == "secret line"
+    assert captured.get("content") is None
+
+
+def test_invoke_tool_memory_remove_allowed_runs_memory_tool(monkeypatch):
+    """Counter: gate allows remove → _memory_tool called once with old_text."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    memory_tool_mock = MagicMock(return_value="removed")
+    agent._memory_manager = MagicMock()
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", return_value=None):
+        with patch("tools.memory_tool.memory_tool", memory_tool_mock):
+            agent._invoke_tool(
+                "memory",
+                {"action": "remove", "target": "memory", "old_text": "stale fact"},
+                effective_task_id="task-rm-2",
+            )
+
+    assert memory_tool_mock.call_count == 1
+    call_kwargs = memory_tool_mock.call_args.kwargs
+    assert call_kwargs.get("action") == "remove"
+    assert call_kwargs.get("old_text") == "stale fact"
+
+
+def test_alt_dispatcher_memory_remove_blocked_does_not_call_memory_tool(monkeypatch):
+    """Alt sequential dispatcher path (run_agent.py:8380) for action=remove
+    must run the gate too.  Source-level guard against the same bypass at the
+    second call site."""
+    src = open("/Users/zenflow/.hermes/hermes-agent/run_agent.py", "r", encoding="utf-8").read()
+    # Both call sites must use the inclusive allow-list.
+    occurrences = src.count('action in ("add", "replace", "remove")')
+    assert occurrences >= 2, (
+        f"expected the inclusive allow-list at both dispatcher sites; got {occurrences} "
+        "(finding #2: remove action must hit the pre_memory_write gate)"
+    )
+
+
 def test_helper_blocks_when_one_callback_raises_alongside_others():
     """A second observer-only callback returning None must NOT mask the
     raised callback's fail-closed semantics."""
