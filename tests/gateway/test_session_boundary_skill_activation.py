@@ -405,3 +405,291 @@ def test_run_py_clears_activation_on_was_auto_reset_path():
         "— round-7 H1 leak across the idle/daily/suspended auto-reset "
         "boundary (codex round-6 HIGH conf 0.9)"
     )
+
+
+# ---------------------------------------------------------------------------
+# OQ-31 (D-013 round-7 regression): same-turn slash activation protection
+# ---------------------------------------------------------------------------
+#
+# Round-7's unconditional clear at the was_auto_reset boundary fixed the
+# OQ-30-style leak from the *expired* session_id, but introduced a new
+# regression: when the FIRST message after idle/daily/suspended is a slash
+# skill, the slash dispatcher in handle_message persists activation
+# (cache + DB) BEFORE _handle_message_with_agent runs.  The auto-reset
+# clear inside _handle_message_with_agent then deletes that fresh
+# activation, and slash skills (unlike auto_skill / channel bindings)
+# have no repopulator for the rest of the turn — the user's slash skill
+# runs without active_project set.
+#
+# Codex round-7 finding (review-moq11qzm-jdrcx7, HIGH conf 0.92).
+# Required test (per finding): first post-idle/daily/suspended message is
+# a slash skill, assert active_project resolves correctly.
+#
+# Approach implemented (per AUDIT.md): per-turn guard set
+# `_slash_activation_this_turn` populated by the slash dispatcher, consulted
+# by `_clear_session_activation_unless_just_set` inside the
+# was_auto_reset branch — the boundary clear is suppressed only for the
+# session_key whose activation was set this very turn.
+
+
+def _make_runner_with_guard():
+    """Build a minimally-stubbed runner exposing the OQ-31 guard surface.
+
+    We don't need the full gateway plumbing — just the methods under
+    test (`_clear_session_activation_unless_just_set` and
+    `_clear_session_activation`) plus the in-memory cache and the per-turn
+    set.  The DB call inside `_clear_session_activation` is monkeypatched
+    in tests via the `patched_clear` fixture.
+    """
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._session_skill_context = {}
+    runner._slash_activation_this_turn = set()
+    return runner
+
+
+def test_oq31_unless_just_set_preserves_same_turn_activation(
+    patched_clear: Path,
+):
+    """OQ-31 core: the same-turn-protection guard preserves the
+    activation row + cache when session_key is in
+    `_slash_activation_this_turn`, and consumes the entry."""
+    from gateway import skill_state_db as ssdb
+
+    src = _make_source()
+    skey = build_session_key(src)
+
+    runner = _make_runner_with_guard()
+    runner._session_skill_context[skey] = {
+        "active_skill": "maestro-just-set",
+        "channel_id": None,
+        "project": "just-set-project",
+    }
+    _seed_activation(patched_clear, skey)
+    # Re-seed using the just-set values so the assertion below checks
+    # what the slash dispatcher would have written.
+    ssdb.record_activation(
+        skey, "maestro-just-set",
+        channel_id=None, project="just-set-project",
+        source="slash",
+    )
+    runner._slash_activation_this_turn.add(skey)
+
+    cleared = runner._clear_session_activation_unless_just_set(skey)
+
+    assert cleared is False, "guard MUST report 'preserved' for same-turn writer"
+    assert skey not in runner._slash_activation_this_turn, (
+        "guard MUST consume the per-turn set entry to avoid leaking into next turn"
+    )
+    assert skey in runner._session_skill_context, (
+        "in-memory activation MUST survive auto-reset clear when set this turn"
+    )
+    assert runner._session_skill_context[skey]["project"] == "just-set-project"
+
+    persisted = ssdb.get_activation(skey)
+    assert persisted is not None, (
+        "DB row MUST survive auto-reset clear when activation was set this turn"
+    )
+    assert persisted["project"] == "just-set-project"
+    assert persisted["active_skill"] == "maestro-just-set"
+
+
+def test_oq31_unless_just_set_clears_when_not_in_set(
+    patched_clear: Path,
+):
+    """OQ-31 negative: when no slash activation was written this turn,
+    the guard MUST fall through to the unconditional clear (preserving
+    OQ-30 / round-6 behavior — drop the stale row from the previous
+    session_id)."""
+    from gateway import skill_state_db as ssdb
+
+    src = _make_source()
+    skey = build_session_key(src)
+
+    runner = _make_runner_with_guard()
+    runner._session_skill_context[skey] = {
+        "active_skill": "maestro-stale",
+        "channel_id": None,
+        "project": "stale-project",
+    }
+    _seed_activation(patched_clear, skey)
+    assert ssdb.get_activation(skey) is not None
+    # Note: _slash_activation_this_turn intentionally empty.
+
+    cleared = runner._clear_session_activation_unless_just_set(skey)
+
+    assert cleared is True, "guard MUST clear when no same-turn writer marked"
+    assert skey not in runner._session_skill_context
+    assert ssdb.get_activation(skey) is None
+
+
+def test_oq31_unless_just_set_handles_empty_session_key():
+    """Defensive: empty session_key returns False (preserved=False but
+    nothing happened)."""
+    runner = _make_runner_with_guard()
+    assert runner._clear_session_activation_unless_just_set("") is False
+
+
+def test_oq31_run_py_uses_guard_in_was_auto_reset_block():
+    """Source-level regression guard for OQ-31: the was_auto_reset block
+    must call the SAME-TURN-AWARE helper, not the unconditional clear.
+
+    This is the structural ratchet that catches a future round-N
+    regression where someone reverts to `_clear_session_activation`
+    inside the was_auto_reset block.  Distinct from
+    `test_run_py_clears_activation_on_was_auto_reset_path` which only
+    checks substring "_clear_session_activation" (matches both helper
+    names).  Here we assert the guarded form explicitly.
+    """
+    src = (
+        Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+    ).read_text(encoding="utf-8")
+
+    idx = src.find("if getattr(session_entry, 'was_auto_reset', False):")
+    end = src.find("session_entry.was_auto_reset = False", idx)
+    assert idx != -1 and end != -1, (
+        "was_auto_reset block bookends missing; structure changed"
+    )
+    window = src[idx:end]
+    assert "_clear_session_activation_unless_just_set" in window, (
+        "was_auto_reset block uses unconditional `_clear_session_activation` "
+        "— OQ-31 regression: slash-skill activation set THIS turn would be "
+        "deleted before pre_memory_write reads it.  Use "
+        "`_clear_session_activation_unless_just_set` instead."
+    )
+
+
+def test_oq31_slash_dispatcher_marks_same_turn_set():
+    """Source-level: the slash-skill dispatcher block must populate
+    `_slash_activation_this_turn` after writing activation, otherwise
+    the guard above is a no-op for real slash messages."""
+    src = (
+        Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+    ).read_text(encoding="utf-8")
+
+    # Find the slash-skill activation cache write.
+    idx = src.find('_skill_ctx_dict[_quick_key] = {')
+    assert idx != -1, "slash-skill cache write missing; structure changed"
+    # Search forward to record_activation call.
+    rec_idx = src.find("_ssdb.record_activation(", idx)
+    assert rec_idx != -1, "slash-skill DB record call missing"
+    window = src[idx:rec_idx + 800]
+    assert "_slash_activation_this_turn.add(_quick_key)" in window, (
+        "slash-skill dispatcher does NOT populate _slash_activation_this_turn "
+        "after the cache/DB write — OQ-31 guard is unreachable for real "
+        "slash invocations"
+    )
+
+
+def test_oq31_init_creates_per_turn_set():
+    """Smoke: GatewayRunner.__init__ must declare
+    `_slash_activation_this_turn` as a set so the guard can be consulted
+    even on the very first message after process startup."""
+    src = (
+        Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+    ).read_text(encoding="utf-8")
+    assert "self._slash_activation_this_turn: set[str] = set()" in src, (
+        "GatewayRunner.__init__ does not initialize "
+        "_slash_activation_this_turn; the guard cannot fire"
+    )
+
+
+@pytest.mark.parametrize("reason", ["idle", "daily", "suspended"])
+def test_oq31_first_slash_after_auto_reset_preserves_active_project(
+    patched_clear: Path, reason: str,
+):
+    """OQ-31 behavioral test (codex round-7 required): when the FIRST
+    message after idle / daily / suspended auto-reset is a slash skill,
+    `active_project` resolves correctly for `pre_memory_write` because
+    the same-turn-protection guard preserves the just-set activation.
+
+    We compose the behavior from the underlying surfaces rather than
+    invoking `_handle_message_with_agent` end-to-end (which requires
+    hooks, config, transcript, agent cache, etc.):
+      1. Slash dispatcher effect: write activation to cache+DB and add
+         session_key to `_slash_activation_this_turn`.
+      2. Auto-reset boundary effect: invoke
+         `_clear_session_activation_unless_just_set(session_key)`.
+      3. Read path: assert `active_project` is the new project, not None
+         and not the previous session's stale project.
+
+    Parametrized over `auto_reset_reason` to cover all three triggers
+    (idle, daily, suspended) since the boundary handler treats them
+    identically wrt the activation clear.
+    """
+    from gateway import skill_state_db as ssdb
+
+    src = _make_source()
+    skey = build_session_key(src)
+
+    # Pre-state: previous (now-expired) session had a different slash skill.
+    # The auto-reset rotated session_id but the row in the DB is keyed on
+    # session_key, so it would normally be the stale row to clear.
+    runner = _make_runner_with_guard()
+    runner._session_skill_context[skey] = {
+        "active_skill": "maestro-stale",
+        "channel_id": None,
+        "project": "stale-project",
+    }
+    ssdb.record_activation(
+        skey, "maestro-stale",
+        channel_id=None, project="stale-project", source="slash",
+    )
+
+    # Simulate the slash dispatcher of THIS turn (handle_message branch
+    # at gateway/run.py:3805-3911) — runs BEFORE the auto-reset clear.
+    # The user invoked /skill-fresh, so cache + DB get the new row.
+    runner._session_skill_context[skey] = {
+        "active_skill": "maestro-fresh",
+        "channel_id": None,
+        "project": f"fresh-project-{reason}",
+    }
+    ssdb.record_activation(
+        skey, "maestro-fresh",
+        channel_id=None, project=f"fresh-project-{reason}", source="slash",
+    )
+    runner._slash_activation_this_turn.add(skey)
+
+    # Now _handle_message_with_agent reaches the was_auto_reset block
+    # and calls the guard — it MUST preserve the writer-1 activation.
+    runner._clear_session_activation_unless_just_set(skey)
+
+    # Read path mirrors gateway/run.py:10096-10127 (apply_skill_context).
+    persisted = ssdb.get_activation(skey)
+    assert persisted is not None, (
+        f"first slash skill after {reason} auto-reset lost its activation row "
+        "— OQ-31 regression"
+    )
+    assert persisted["project"] == f"fresh-project-{reason}", (
+        f"active_project wrong after {reason} auto-reset; expected fresh, got "
+        f"{persisted['project']!r}"
+    )
+    assert persisted["active_skill"] == "maestro-fresh"
+    cache = runner._session_skill_context.get(skey)
+    assert cache is not None
+    assert cache["project"] == f"fresh-project-{reason}"
+
+
+def test_oq31_handle_message_finally_clears_per_turn_set():
+    """Source-level: handle_message's outer `finally:` MUST discard the
+    `_slash_activation_this_turn` entry as defense-in-depth, so a crash
+    inside `_handle_message_with_agent` (before the auto-reset branch
+    consumes the entry) cannot leak the marker into the next turn and
+    falsely protect a genuine boundary clear."""
+    src = (
+        Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+    ).read_text(encoding="utf-8")
+
+    # Locate the handle_message finally block: anchored on the unique
+    # comment immediately preceding the agent-claim sentinel cleanup.
+    anchor = "# If _run_agent replaced the sentinel with a real agent and"
+    idx = src.find(anchor)
+    assert idx != -1, "handle_message finally anchor missing; structure changed"
+    # Search the next ~1500 chars (one finally block) for the discard.
+    window = src[idx: idx + 1500]
+    assert "_slash_activation_this_turn" in window, (
+        "handle_message finally: does not discard _slash_activation_this_turn "
+        "— a crash inside _handle_message_with_agent could leak the "
+        "marker into the next turn"
+    )

@@ -704,6 +704,22 @@ class GatewayRunner:
         # ongoing sessions keep the skill loaded in their conversation history.
         self._session_skill_context: Dict[str, Dict[str, Optional[str]]] = {}
 
+        # OQ-31 (D-013 round-7 regression): per-turn guard set marking
+        # session_keys whose slash-skill activation was just persisted by
+        # THIS turn's slash dispatcher (in handle_message), so the
+        # was_auto_reset boundary clear inside _handle_message_with_agent
+        # does NOT delete the activation the user just installed milliseconds
+        # earlier on the same inbound message.
+        #
+        # Per-session_key serialization is already enforced upstream of the
+        # slash writer: handle_message blocks at L3245-3291 if another agent
+        # is in flight for the same _quick_key, so two concurrent messages
+        # cannot race the set in/out.  The entry is consumed inside
+        # _clear_session_activation_unless_just_set during the auto-reset
+        # branch.  The handle_message finally: also discards the entry as
+        # defense-in-depth for crash paths where the consumer never runs.
+        self._slash_activation_this_turn: set[str] = set()
+
 
 
         # Ensure tirith security scanner is available (downloads if needed)
@@ -3854,6 +3870,18 @@ class GatewayRunner:
                                     "channel_id": _channel_id_str,
                                     "project": _project_tag,
                                 }
+                                # OQ-31 (D-013 round-7 regression guard):
+                                # mark this session_key as having a fresh
+                                # slash-skill activation set THIS turn.  The
+                                # auto-reset branch in
+                                # _handle_message_with_agent uses this set
+                                # via _clear_session_activation_unless_just_set
+                                # to skip the boundary clear for the row we
+                                # just installed.  Mark unconditionally after
+                                # the cache write — even if the DB persist
+                                # below fails, the cache holds the activation
+                                # and we still want to protect it.
+                                self._slash_activation_this_turn.add(_quick_key)
                                 # OQ-28: write-through to durable activations
                                 # DB so the next turn after a gateway restart
                                 # can resolve active_skill/active_project from
@@ -3941,6 +3969,17 @@ class GatewayRunner:
                 self._running_agents_ts.pop(_quick_key, None)
                 if hasattr(self, "_busy_ack_ts"):
                     self._busy_ack_ts.pop(_quick_key, None)
+            # OQ-31 defense-in-depth: drop any lingering same-turn-set
+            # entry.  Under normal operation
+            # _clear_session_activation_unless_just_set has already
+            # consumed it inside _handle_message_with_agent.  This
+            # cleanup matters only if _handle_message_with_agent raised
+            # before reaching the auto-reset branch (so the entry would
+            # otherwise leak into the NEXT turn and falsely protect a
+            # genuine boundary clear).  Idempotent.
+            _stt_guard = getattr(self, "_slash_activation_this_turn", None)
+            if isinstance(_stt_guard, set):
+                _stt_guard.discard(_quick_key)
 
     async def _prepare_inbound_message_text(
         self,
@@ -4227,7 +4266,15 @@ class GatewayRunner:
             # from the stale ``slash_skill_activations`` row keyed on
             # session_key, leaking the expired session's active_project
             # into the fresh auto-reset transcript.
-            self._clear_session_activation(session_key)
+            #
+            # OQ-31 (round-7 regression, codex round-7 HIGH conf 0.92):
+            # use the same-turn-protection guard so a slash-skill
+            # activation persisted by THIS turn's slash dispatcher (in
+            # handle_message, BEFORE _handle_message_with_agent runs)
+            # is preserved.  Only the *previous* session_id's stale row
+            # — never the writer that ran milliseconds ago for the
+            # fresh session — should be dropped here.
+            self._clear_session_activation_unless_just_set(session_key)
 
             session_entry.was_auto_reset = False
             session_entry.auto_reset_reason = None
@@ -8942,6 +8989,45 @@ class GatewayRunner:
                 "[Gateway] activation DB clear failed (non-fatal): %s",
                 _clear_db_err,
             )
+
+    def _clear_session_activation_unless_just_set(self, session_key: str) -> bool:
+        """OQ-31 (D-013 round-7 regression guard): boundary-aware clear.
+
+        The was_auto_reset auto-reset branch in
+        ``_handle_message_with_agent`` runs AFTER ``handle_message``'s
+        slash-skill dispatcher has already persisted activation for the
+        current turn.  The unconditional clear added in round-7 (commit
+        984cf7aef) deletes that fresh activation, breaking the user's
+        first slash skill after idle/daily/suspended.  Slash skills do
+        NOT carry ``event.auto_skill``, so the auto_skill repopulator
+        below never runs to reinstate the row — the activation stays
+        gone for the entire turn, leading to fail-OPEN/None project
+        resolution in pre_memory_write.
+
+        Fix: consult the per-turn ``_slash_activation_this_turn`` set
+        populated by the slash dispatcher.  If this session_key is in
+        the set, the activation row was written for THIS turn (under
+        the new session_id, post-rotation) and must be preserved —
+        consume the entry and skip the clear.  Otherwise the clear
+        runs unchanged: the stale row from the *previous* session_id
+        is dropped, preserving the OQ-30 / round-6 behavior.
+
+        Returns True if the activation was cleared, False if preserved
+        (useful for tests).
+        """
+        if not session_key:
+            return False
+        guard = getattr(self, "_slash_activation_this_turn", None)
+        if isinstance(guard, set) and session_key in guard:
+            guard.discard(session_key)
+            logger.debug(
+                "[Gateway] OQ-31 guard: preserving slash activation "
+                "set this turn for session %s (auto-reset clear skipped)",
+                session_key[:20],
+            )
+            return False
+        self._clear_session_activation(session_key)
+        return True
 
     def _clear_session_boundary_security_state(self, session_key: str) -> None:
         """Clear approval state that must not survive a real conversation switch."""
