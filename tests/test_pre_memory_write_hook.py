@@ -557,3 +557,79 @@ def test_helper_returns_block_with_real_message_for_sentinel():
         import pytest
         pytest.skip("maestro-memory-guard not loaded in this test environment")
     assert "self-digest" in result.lower() or "Self Digest" in result
+
+
+# -----------------------------------------------------------------------------
+# Codex adversarial review — Finding #4 (HIGH): guard plugin crashes fail open.
+#
+# `invoke_hook` swallows callback exceptions and just logs them.  A plugin that
+# raises while validating a memory write would silently allow the write through
+# the gate.  The helper must treat a raised callback as a conservative block.
+# -----------------------------------------------------------------------------
+
+
+def test_helper_blocks_when_hook_callback_raises():
+    """A pre_memory_write callback that raises must FAIL CLOSED — the helper
+    must surface a block message instead of returning None (which allows)."""
+    manager = plugins_mod.get_plugin_manager()
+
+    def _broken_guard(**_kwargs):
+        raise RuntimeError("guard plugin exploded validating policy")
+
+    # Register the broken guard under a sacrificial name then restore.
+    callbacks = manager._hooks.setdefault("pre_memory_write", [])
+    callbacks.append(_broken_guard)
+    try:
+        result = plugins_mod.get_pre_memory_write_block_message(
+            action="add",
+            target="memory",
+            content="anything",
+            write_path="flush",
+        )
+    finally:
+        try:
+            callbacks.remove(_broken_guard)
+        except ValueError:
+            pass
+
+    assert result is not None, (
+        "fail-open: a pre_memory_write callback raised but the helper allowed "
+        "the write to proceed (returned None)"
+    )
+    assert "RuntimeError" in result or "exploded" in result, (
+        f"block message should reference the failure; got: {result!r}"
+    )
+
+
+def test_helper_blocks_when_one_callback_raises_alongside_others():
+    """A second observer-only callback returning None must NOT mask the
+    raised callback's fail-closed semantics."""
+    manager = plugins_mod.get_plugin_manager()
+
+    def _broken_guard(**_kwargs):
+        raise ValueError("kaboom")
+
+    def _silent_observer(**_kwargs):
+        return None  # well-behaved observer
+
+    callbacks = manager._hooks.setdefault("pre_memory_write", [])
+    callbacks.append(_silent_observer)
+    callbacks.append(_broken_guard)
+    try:
+        result = plugins_mod.get_pre_memory_write_block_message(
+            action="add",
+            target="memory",
+            content="anything",
+            write_path="tool",
+        )
+    finally:
+        for cb in (_silent_observer, _broken_guard):
+            try:
+                callbacks.remove(cb)
+            except ValueError:
+                pass
+
+    assert result is not None, "fail-open: raised callback ignored by helper"
+    assert "ValueError" in result or "kaboom" in result, (
+        f"block message should reference the failure; got: {result!r}"
+    )

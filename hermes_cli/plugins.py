@@ -944,11 +944,24 @@ class PluginManager:
     # Hook invocation
     # -----------------------------------------------------------------------
 
-    def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
+    def invoke_hook(
+        self,
+        hook_name: str,
+        *,
+        strict: bool = False,
+        **kwargs: Any,
+    ) -> List[Any]:
         """Call all registered callbacks for *hook_name*.
 
-        Each callback is wrapped in its own try/except so a misbehaving
-        plugin cannot break the core agent loop.
+        By default each callback is wrapped in its own try/except so a
+        misbehaving plugin cannot break the core agent loop.
+
+        When ``strict=True`` (used by write-gate hooks like
+        ``pre_memory_write``) a raised callback surfaces a synthetic
+        ``{"action": "block", "message": ...}`` result instead of being
+        silently logged.  Caller is responsible for treating that as a
+        fail-closed signal.  Other callbacks still run (their results
+        are still collected) so independent guards can vote.
 
         Returns a list of non-``None`` return values from callbacks.
 
@@ -972,12 +985,25 @@ class PluginManager:
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
-                logger.warning(
-                    "Hook '%s' callback %s raised: %s",
-                    hook_name,
-                    getattr(cb, "__name__", repr(cb)),
-                    exc,
-                )
+                cb_name = getattr(cb, "__name__", repr(cb))
+                if strict:
+                    logger.error(
+                        "Hook '%s' callback %s raised %s: %s — "
+                        "STRICT mode: surfacing as block",
+                        hook_name, cb_name, type(exc).__name__, exc,
+                    )
+                    results.append({
+                        "action": "block",
+                        "message": (
+                            f"Memory write blocked: pre_memory_write hook "
+                            f"{cb_name} raised {type(exc).__name__}: {exc}"
+                        ),
+                    })
+                else:
+                    logger.warning(
+                        "Hook '%s' callback %s raised: %s",
+                        hook_name, cb_name, exc,
+                    )
         return results
 
     # -----------------------------------------------------------------------
@@ -1129,9 +1155,17 @@ def get_pre_memory_write_block_message(
     indicates which call site is asking.  Plugins MAY use this to apply
     different policy (e.g. block the flush path entirely while allowing
     explicit tool calls).
+
+    Fail-closed semantics (D-013 enforcement, codex round-10 finding #4):
+    a pre_memory_write callback that RAISES is treated as a conservative
+    block, not silently logged-and-ignored as the generic ``invoke_hook``
+    does for observer hooks.  We invoke with ``strict=True`` which
+    surfaces raised callbacks as synthetic block dicts.  A guard plugin
+    that crashes mid-validation must NOT allow the write to proceed.
     """
     hook_results = invoke_hook(
         "pre_memory_write",
+        strict=True,
         action=action,
         target=target,
         content=content,
