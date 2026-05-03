@@ -1770,3 +1770,122 @@ def test_provider_registry_covers_every_honcho_tool_via_introspection():
             f"hard-block this tool until classified.  Add an entry: "
             f"\"{tool}\": \"read\" (or \"add\"/\"replace\"/\"remove\")."
         )
+
+# -----------------------------------------------------------------------------
+# Round-3 H2: slash-skill context still process-local on restart.
+#
+# Round-2 fixed the auto_skill path by recomputing every turn from
+# event.auto_skill.  But the slash-skill path writes to
+# _session_skill_context ONCE at slash invocation and never rebuilds it.
+# After a gateway restart, follow-up turns in a slash-active session see an
+# empty dict — apply_skill_context(None) clears active_skill/project, and
+# pre_memory_write loses the project tag → cross-project leak.
+#
+# Fix: detect slash-skill activation from transcript history when no
+# in-memory context exists for this session.  Use the literal SYSTEM marker
+# emitted by build_skill_invocation_message in agent/skill_commands.py.
+# -----------------------------------------------------------------------------
+
+
+def test_slash_skill_marker_format_pinned_in_skill_commands():
+    """Pin the literal marker format used to detect slash-skill activation
+    from transcript history.  If skill_commands.py changes the marker, this
+    test fails — flagging that the gateway recovery regex must update too."""
+    src = open(
+        "/Users/zenflow/.hermes/hermes-agent/agent/skill_commands.py",
+        "r", encoding="utf-8",
+    ).read()
+    # build_skill_invocation_message must emit this exact prefix; the gateway
+    # recovery code (gateway/run.py) regex-matches against it.
+    assert (
+        '[SYSTEM: The user has invoked the "'
+    ) in src, (
+        "slash-skill marker format changed in skill_commands.py — update "
+        "the recovery regex in gateway/run.py to match the new marker"
+    )
+
+
+def test_gateway_recovers_slash_skill_context_from_transcript():
+    """Source-level guard: gateway/run.py must contain logic that, when
+    _session_skill_context lacks an entry for the current session AND no
+    auto_skill is active, scans the loaded transcript for the slash-skill
+    SYSTEM marker and rebuilds the context dict from the LAST match.
+
+    Round-3 finding H2: without this, a gateway restart between slash
+    invocation and follow-up turns leaks project context (active_skill /
+    project become None, defeating the maestro-memory-guard policy).
+    """
+    src = open(
+        "/Users/zenflow/.hermes/hermes-agent/gateway/run.py",
+        "r", encoding="utf-8",
+    ).read()
+    # The recovery code must reference the slash-skill marker AND iterate
+    # in a way that picks the LAST occurrence (re.findall + [-1], or a
+    # reverse scan, etc.).  Pin a stable structural marker.
+    assert "The user has invoked the" in src, (
+        "gateway/run.py is missing the slash-skill marker recovery — "
+        "post-restart slash-active sessions will leak project context"
+    )
+
+
+def test_recover_slash_skill_context_from_history_picks_last_marker():
+    """Behavioural test of the recovery helper: given a transcript with
+    multiple slash-skill invocations, recovery returns the LAST one (the
+    currently active skill), not the first.
+
+    Mirrors the codex advisor's H2 hazard #1: if the user invoked /skill-a
+    then /skill-b, the active skill is b."""
+    from gateway.run import _recover_slash_skill_from_history
+
+    history = [
+        {"role": "user", "content": "[SYSTEM: The user has invoked the \"maestro-projectA\" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]\nDo X please"},
+        {"role": "assistant", "content": "OK doing X"},
+        {"role": "user", "content": "Now switch context"},
+        {"role": "user", "content": "[SYSTEM: The user has invoked the \"maestro-projectB\" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]\nNow do Y"},
+        {"role": "assistant", "content": "Sure, doing Y"},
+    ]
+    skill_name = _recover_slash_skill_from_history(history)
+    assert skill_name == "maestro-projectB", (
+        f"recovery picked the wrong marker (expected last/most-recent skill); "
+        f"got {skill_name!r}"
+    )
+
+
+def test_recover_slash_skill_context_returns_none_for_empty_or_no_marker():
+    """Recovery returns None when no slash-skill marker exists in history,
+    so the caller does not over-populate context for plain auto_skill or
+    fresh sessions."""
+    from gateway.run import _recover_slash_skill_from_history
+
+    assert _recover_slash_skill_from_history([]) is None
+    assert _recover_slash_skill_from_history([
+        {"role": "user", "content": "Hi"},
+        {"role": "assistant", "content": "Hello!"},
+    ]) is None
+    # An auto_skill activation note is a different marker — must not
+    # match the slash-skill recovery regex.
+    assert _recover_slash_skill_from_history([
+        {"role": "user", "content": "[SYSTEM: The \"maestro-foo\" skill is auto-loaded. Follow its instructions for this session.]"},
+    ]) is None
+
+
+def test_gateway_recovery_runs_only_when_dict_missing_and_no_auto_skill():
+    """The recovery code must guard with `if session_key not in
+    _session_skill_context` AND `not _auto` — otherwise it fires every turn
+    (wasteful) and would clobber the auto_skill path.
+
+    Source-level guard pinning the codex advisor's H2 hazard #2."""
+    src = open(
+        "/Users/zenflow/.hermes/hermes-agent/gateway/run.py",
+        "r", encoding="utf-8",
+    ).read()
+    # Find the recovery block.  It must reference the helper, the dict
+    # check, and the auto_skill guard in proximity.
+    rec_idx = src.find("_recover_slash_skill_from_history")
+    assert rec_idx > 0, "recovery helper not wired into gateway/run.py"
+    # Look at a 1500-char window around the call site for the guards.
+    window = src[max(0, rec_idx - 800): rec_idx + 1200]
+    assert "_session_skill_context" in window, (
+        "recovery block does not reference _session_skill_context — must "
+        "only fire when the dict is empty for this session_key"
+    )

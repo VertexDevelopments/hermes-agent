@@ -480,6 +480,65 @@ def _check_unavailable_skill(command_name: str) -> str | None:
     return None
 
 
+# Regex matching the slash-skill activation marker emitted by
+# agent.skill_commands.build_skill_invocation_message — kept in sync with
+# the literal string in skill_commands.py:454-456.  The skill name is the
+# first capture group.  Used by _recover_slash_skill_from_history to
+# reconstruct active slash-skill context after a gateway restart.
+_SLASH_SKILL_MARKER_RE = re.compile(
+    r'\[SYSTEM: The user has invoked the "([^"]+)" skill'
+)
+
+
+def _recover_slash_skill_from_history(
+    history: List[Dict[str, Any]],
+) -> Optional[str]:
+    """Return the most-recent slash-invoked skill name found in transcript
+    history, or None if no slash-skill marker is present.
+
+    Round-3 finding H2: round-2 fixed the auto_skill path by recomputing
+    _session_skill_context every turn from event.auto_skill (which platform
+    adapters resolve fresh per inbound message).  But the slash-skill path
+    populates the dict only ONCE — at /skill-name invocation — so a gateway
+    restart between invocation and the next turn leaves the dict empty,
+    apply_skill_context(None) clears active_skill/project, and
+    pre_memory_write loses the project tag → cross-project leak.
+
+    The recovery scan picks the LAST marker, not the first: if the user
+    invoked /skill-a then later /skill-b, b is the active skill.
+
+    Caller (gateway/run.py:_handle_message_with_agent) invokes this only
+    when:
+      * _session_skill_context lacks an entry for this session_key
+        (otherwise the in-memory dict is authoritative), AND
+      * event.auto_skill is empty (otherwise the auto_skill path handles
+        population every turn — recovery would clobber it).
+
+    Args:
+        history: List of conversation messages as returned by
+            session_store.load_transcript.  Each message must have a
+            "content" key; non-string content is ignored.
+
+    Returns:
+        The skill name from the most recent marker, or None.
+    """
+    if not history:
+        return None
+    last_skill: Optional[str] = None
+    for msg in history:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        # findall returns matches in order; we want the last one in the
+        # whole transcript, so scan every message and overwrite.
+        matches = _SLASH_SKILL_MARKER_RE.findall(content)
+        if matches:
+            last_skill = matches[-1]
+    return last_skill
+
+
 def _platform_config_key(platform: "Platform") -> str:
     """Map a Platform enum to its config.yaml key (LOCAL→"cli", rest→enum value)."""
     return "cli" if platform == Platform.LOCAL else platform.value
@@ -4274,7 +4333,70 @@ class GatewayRunner:
 
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
-        
+
+        # -----------------------------------------------------------------
+        # Round-3 H2: Recover slash-skill context after gateway restart.
+        #
+        # The auto_skill branch above (~line 4280) populates
+        # _session_skill_context every turn from event.auto_skill (set by
+        # platform adapters based on channel bindings, so it survives
+        # restart by being recomputed).  But the slash-skill path
+        # (gateway/run.py:~3801, /skill-name invocation) writes to the
+        # dict ONCE at activation — a gateway restart between activation
+        # and follow-up turns leaves the dict empty, the per-turn
+        # apply_skill_context(None) call then clears active_skill /
+        # project, and pre_memory_write loses the project tag (D-013
+        # confidentiality leak between projects).
+        #
+        # Fix: when the in-memory dict lacks an entry for this session
+        # AND no auto_skill is active for this turn, scan the transcript
+        # for the slash-skill activation marker emitted by
+        # build_skill_invocation_message and rebuild context from the
+        # most recent match (LAST marker — if user did /skill-a then
+        # /skill-b, b is active).
+        #
+        # Guards:
+        #   * `_auto` is empty — the auto_skill branch above already
+        #     handled population if a binding is active.
+        #   * session_key not in dict — if the dict has an entry, it is
+        #     authoritative for this in-memory session.  Recovery would
+        #     either clobber it or be a no-op.
+        # -----------------------------------------------------------------
+        if not _auto:
+            _skill_ctx_dict = getattr(self, "_session_skill_context", None)
+            if (
+                isinstance(_skill_ctx_dict, dict)
+                and session_key not in _skill_ctx_dict
+                and history
+            ):
+                try:
+                    _recovered_skill = _recover_slash_skill_from_history(history)
+                    if _recovered_skill:
+                        _project_tag = _recovered_skill.split("/")[-1].replace(
+                            "maestro-", "", 1
+                        )
+                        _skill_ctx_dict[session_key] = {
+                            "active_skill": _recovered_skill,
+                            "channel_id": (
+                                str(source.chat_id)
+                                if source.chat_id is not None
+                                else None
+                            ),
+                            "project": _project_tag,
+                        }
+                        logger.info(
+                            "[Gateway] recovered slash-skill context for "
+                            "session %s from transcript history: skill=%s "
+                            "project=%s (round-3 H2)",
+                            session_key, _recovered_skill, _project_tag,
+                        )
+                except Exception as _recovery_err:
+                    logger.debug(
+                        "[Gateway] slash-skill recovery from history failed "
+                        "(non-fatal): %s",
+                        _recovery_err,
+                    )
+
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
         #
