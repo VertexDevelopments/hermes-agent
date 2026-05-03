@@ -749,6 +749,16 @@ PROVIDER_MEMORY_TOOL_ACTIONS: Dict[str, str] = {
     "retaindb_read_file": "read",
     "retaindb_ingest_file": "add",   # MISSED by round-1 suffix logic
     "retaindb_delete_file": "remove",  # MISSED by round-1 suffix logic
+    # honcho (Honcho AI-native memory) — read-only tools.
+    # honcho_profile / honcho_conclude are action-dispatched (see
+    # _PROVIDER_ACTION_DISPATCHED below) because their action depends on
+    # argument shape, not the tool name.  Round-3 H1: round-2 omitted the
+    # read tools from this registry, so the unknown-fail-closed branch
+    # hard-blocked legitimate Honcho reads — pure regression.  These tools
+    # never write memory; classify as "read" (no gate).
+    "honcho_search": "read",
+    "honcho_reasoning": "read",
+    "honcho_context": "read",
 }
 
 # Tools whose action depends on argument shape, not the name.  Each has a

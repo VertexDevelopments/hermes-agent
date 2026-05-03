@@ -1614,3 +1614,159 @@ def test_existing_session_after_restart_does_not_clear_context():
         "post-restart turns hit apply_skill_context(None) before the dict is "
         "rebuilt (Bug 1 of round-2 finding H2)"
     )
+
+
+# -----------------------------------------------------------------------------
+# Round-3 H1: Honcho read-only tools (honcho_search / honcho_reasoning /
+# honcho_context) must NOT be classified as unknown.  Round-2 added the
+# fail-closed _PROVIDER_UNKNOWN sentinel but the read-only Honcho tools were
+# never added to PROVIDER_MEMORY_TOOL_ACTIONS, so the gate now hard-blocks
+# pure reads — a regression for Honcho users.
+# -----------------------------------------------------------------------------
+
+
+def test_honcho_read_tools_classify_as_read_only():
+    """honcho_search / honcho_reasoning / honcho_context are read-only and
+    must classify to None (no gate), NOT to the unknown sentinel.
+
+    Round-3 finding H1: round-2 left these out of the registry, so the new
+    fail-closed branch blocked them.  Pure regression for any user with the
+    Honcho plugin enabled — these tools never write memory."""
+    from run_agent import (
+        PROVIDER_MEMORY_TOOL_ACTIONS,
+        _classify_provider_memory_tool_action,
+        _PROVIDER_UNKNOWN,
+    )
+    for tool in ("honcho_search", "honcho_reasoning", "honcho_context"):
+        assert tool in PROVIDER_MEMORY_TOOL_ACTIONS, (
+            f"{tool} missing from registry — falls through to fail-closed "
+            f"branch and blocks read-only Honcho calls"
+        )
+        assert PROVIDER_MEMORY_TOOL_ACTIONS[tool] == "read", (
+            f"{tool} must be classified 'read' (no gate); got "
+            f"{PROVIDER_MEMORY_TOOL_ACTIONS[tool]!r}"
+        )
+        assert _classify_provider_memory_tool_action(tool, {}) is None, (
+            f"{tool} classifier must return None (read-only no-gate); a "
+            f"value of {_PROVIDER_UNKNOWN!r} would block via "
+            f"provider_unknown_write"
+        )
+
+
+def test_invoke_tool_honcho_search_passes_through_to_provider(monkeypatch):
+    """End-to-end: honcho_search reaches MemoryManager.handle_tool_call and
+    is NOT blocked by _gate_provider_memory_tool.  The gate must short-circuit
+    on read-only classification before reaching the unknown-fail-closed branch.
+    """
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value="search results")
+
+    # If the read-only fast path is broken, the gate would see "unknown" and
+    # call the plugin helper with action="provider_unknown_write".  Patch it
+    # to record any unexpected call.
+    gate_calls: list[dict] = []
+
+    def _gate(action, **kwargs):
+        gate_calls.append({"action": action, **kwargs})
+        return None
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", side_effect=_gate):
+        result = agent._invoke_tool(
+            "honcho_search",
+            {"query": "what does the user know about X"},
+            effective_task_id="task-honcho-read-1",
+        )
+
+    assert result == "search results", (
+        f"honcho_search was blocked or rerouted; got {result!r}.  Round-3 "
+        f"regression: read-only Honcho tools must pass through unmodified."
+    )
+    assert agent._memory_manager.handle_tool_call.call_count == 1
+    assert not gate_calls, (
+        f"pre_memory_write was invoked for a read-only tool: {gate_calls!r}"
+    )
+
+
+def test_invoke_tool_honcho_context_passes_through_to_provider(monkeypatch):
+    """honcho_context is read-only — must not invoke the gate."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value="context blob")
+
+    with patch(
+        "hermes_cli.plugins.get_pre_memory_write_block_message",
+        return_value="should not be called",
+    ) as gate:
+        result = agent._invoke_tool(
+            "honcho_context",
+            {"peer": "user"},
+            effective_task_id="task-honcho-read-2",
+        )
+
+    assert result == "context blob"
+    assert gate.call_count == 0, (
+        "pre_memory_write was invoked for honcho_context (read-only)"
+    )
+
+
+def test_invoke_tool_honcho_reasoning_passes_through_to_provider(monkeypatch):
+    """honcho_reasoning is read-only — must not invoke the gate."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value="synthesized answer")
+
+    with patch(
+        "hermes_cli.plugins.get_pre_memory_write_block_message",
+        return_value="should not be called",
+    ) as gate:
+        result = agent._invoke_tool(
+            "honcho_reasoning",
+            {"query": "what does the user prefer"},
+            effective_task_id="task-honcho-read-3",
+        )
+
+    assert result == "synthesized answer"
+    assert gate.call_count == 0
+
+
+def test_provider_registry_covers_every_honcho_tool_via_introspection():
+    """Coverage guard derived from Honcho's actual ALL_TOOL_SCHEMAS — not a
+    hardcoded list.  If Honcho upstream adds a new tool, this test will fail
+    (telling us to classify it) instead of silently blocking it via
+    provider_unknown_write OR — worse — silently allowing it because the
+    hardcoded test list never grew.
+
+    Round-3 finding H1 (second half): round-2's hardcoded coverage test
+    couldn't catch new provider tools added upstream — false guard.  Use
+    introspection over the canonical schema constant."""
+    from plugins.memory.honcho import ALL_TOOL_SCHEMAS
+    from run_agent import (
+        PROVIDER_MEMORY_TOOL_ACTIONS,
+        _PROVIDER_ACTION_DISPATCHED,
+    )
+    honcho_tool_names = {schema["name"] for schema in ALL_TOOL_SCHEMAS}
+    # Sanity — Honcho ships at least the 5 known tools.  If the upstream
+    # plugin somehow degenerates to a smaller set, fail loudly.
+    assert {"honcho_profile", "honcho_search", "honcho_reasoning",
+            "honcho_context", "honcho_conclude"} <= honcho_tool_names, (
+        f"Honcho ALL_TOOL_SCHEMAS shrank unexpectedly: {honcho_tool_names!r}"
+    )
+    for tool in honcho_tool_names:
+        if tool in _PROVIDER_ACTION_DISPATCHED:
+            continue  # action-dispatched tools have their own special-case branch
+        assert tool in PROVIDER_MEMORY_TOOL_ACTIONS, (
+            f"Honcho ships {tool!r} but run_agent.PROVIDER_MEMORY_TOOL_ACTIONS "
+            f"does not classify it.  The unknown-fail-closed branch will "
+            f"hard-block this tool until classified.  Add an entry: "
+            f"\"{tool}\": \"read\" (or \"add\"/\"replace\"/\"remove\")."
+        )
