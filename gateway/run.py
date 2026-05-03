@@ -3831,6 +3831,34 @@ class GatewayRunner:
                     )
                     if msg:
                         event.text = msg
+                        # Round-2 H2 Bug 2: slash-skill path must mirror the
+                        # auto_skill branch and persist active skill context
+                        # for pre_memory_write hooks.  Without this the next
+                        # turn's apply_skill_context sees an empty dict and
+                        # clears active_skill/project, breaking project-
+                        # confidentiality policy on memory writes performed
+                        # by the slash-invoked skill.
+                        try:
+                            _skill_ctx_dict = getattr(self, "_session_skill_context", None)
+                            if isinstance(_skill_ctx_dict, dict) and _skill_name:
+                                _project_tag = _skill_name.split("/")[-1].replace(
+                                    "maestro-", "", 1
+                                )
+                                _skill_ctx_dict[_quick_key] = {
+                                    "active_skill": _skill_name,
+                                    "channel_id": (
+                                        str(source.chat_id)
+                                        if source.chat_id is not None
+                                        else None
+                                    ),
+                                    "project": _project_tag,
+                                }
+                        except Exception as _slash_ctx_err:
+                            logger.debug(
+                                "[Gateway] slash-skill context update failed "
+                                "(non-fatal): %s",
+                                _slash_ctx_err,
+                            )
                         # Fall through to normal message processing with skill content
                 else:
                     # Not an active skill — check if it's a known-but-disabled or
@@ -4174,53 +4202,75 @@ class GatewayRunner:
 
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
-        # Only inject on NEW sessions — ongoing conversations already have the
-        # skill content in their conversation history from the first message.
+        #
+        # Skill PAYLOAD INJECTION only fires on NEW sessions — ongoing
+        # conversations already have the skill content in their conversation
+        # history from the first message.  But the SKILL CONTEXT (used by
+        # pre_memory_write to identify project/channel) MUST be repopulated
+        # every turn `auto_skill` is set.  This is round-2 finding H2 Bug 1:
+        # round-1 only populated the dict on _is_new_session, so a gateway
+        # restart cleared it while the transcript still held the skill —
+        # apply_skill_context(None) then nulled active_skill/project, leaving
+        # pre_memory_write unable to apply project-confidentiality policy.
+        #
+        # Recompute every turn from event.auto_skill: the platform adapters
+        # resolve auto_skill on every inbound message from the channel
+        # binding (see telegram.py:topic_skill, discord.py:_resolve_channel_
+        # skills), so the dict can be rebuilt deterministically without
+        # per-session disk persistence.
         _auto = getattr(event, "auto_skill", None)
-        if _is_new_session and _auto:
+        if _auto:
             _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
             try:
-                from agent.skill_commands import _load_skill_payload, _build_skill_message
-                _combined_parts: list[str] = []
-                _loaded_names: list[str] = []
-                for _sname in _skill_names:
-                    _loaded = _load_skill_payload(_sname, task_id=_quick_key)
-                    if _loaded:
-                        _loaded_skill, _skill_dir, _display_name = _loaded
-                        _note = (
-                            f'[SYSTEM: The "{_display_name}" skill is auto-loaded. '
-                            f"Follow its instructions for this session.]"
-                        )
-                        _part = _build_skill_message(_loaded_skill, _skill_dir, _note)
-                        if _part:
-                            _combined_parts.append(_part)
-                            _loaded_names.append(_sname)
-                    else:
-                        logger.warning("[Gateway] Auto-skill '%s' not found", _sname)
-                if _combined_parts:
-                    # Append the user's original text after all skill payloads
-                    _combined_parts.append(event.text)
-                    event.text = "\n\n".join(_combined_parts)
-                    logger.info(
-                        "[Gateway] Auto-loaded skill(s) %s for session %s",
-                        _loaded_names, session_key,
-                    )
-                    # Persist active skill context for pre_memory_write hooks
-                    # (codex round-10 finding #1).  Project tag is derived from
-                    # the first loaded skill — most channel-bound auto_skill
-                    # configurations load a single project skill.  Plugins that
-                    # need richer context can still fall back to the session file.
-                    _primary = _loaded_names[0]
-                    _project_tag = _primary.split("/")[-1].replace("maestro-", "", 1)
-                    _skill_ctx_dict = getattr(self, "_session_skill_context", None)
-                    if isinstance(_skill_ctx_dict, dict):
-                        _skill_ctx_dict[session_key] = {
-                            "active_skill": _primary,
-                            "channel_id": str(source.chat_id) if source.chat_id is not None else None,
-                            "project": _project_tag,
-                        }
+                # Always populate _session_skill_context, regardless of
+                # _is_new_session (round-2 H2 fix).  Project tag is derived
+                # from the first skill — most channel-bound auto_skill
+                # configurations load a single project skill.
+                _primary = _skill_names[0]
+                _project_tag = _primary.split("/")[-1].replace("maestro-", "", 1)
+                _skill_ctx_dict = getattr(self, "_session_skill_context", None)
+                if isinstance(_skill_ctx_dict, dict):
+                    _skill_ctx_dict[session_key] = {
+                        "active_skill": _primary,
+                        "channel_id": str(source.chat_id) if source.chat_id is not None else None,
+                        "project": _project_tag,
+                    }
             except Exception as e:
-                logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
+                logger.warning(
+                    "[Gateway] Failed to populate skill context for %s: %s",
+                    _skill_names, e,
+                )
+
+            # Skill payload injection — new sessions only.
+            if _is_new_session:
+                try:
+                    from agent.skill_commands import _load_skill_payload, _build_skill_message
+                    _combined_parts: list[str] = []
+                    _loaded_names: list[str] = []
+                    for _sname in _skill_names:
+                        _loaded = _load_skill_payload(_sname, task_id=_quick_key)
+                        if _loaded:
+                            _loaded_skill, _skill_dir, _display_name = _loaded
+                            _note = (
+                                f'[SYSTEM: The "{_display_name}" skill is auto-loaded. '
+                                f"Follow its instructions for this session.]"
+                            )
+                            _part = _build_skill_message(_loaded_skill, _skill_dir, _note)
+                            if _part:
+                                _combined_parts.append(_part)
+                                _loaded_names.append(_sname)
+                        else:
+                            logger.warning("[Gateway] Auto-skill '%s' not found", _sname)
+                    if _combined_parts:
+                        # Append the user's original text after all skill payloads
+                        _combined_parts.append(event.text)
+                        event.text = "\n\n".join(_combined_parts)
+                        logger.info(
+                            "[Gateway] Auto-loaded skill(s) %s for session %s",
+                            _loaded_names, session_key,
+                        )
+                except Exception as e:
+                    logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
