@@ -404,3 +404,89 @@ def test_migrate_default_db_path_respects_hermes_home(
         f"expected {expected} to exist"
     )
 
+
+# --- OQ-30: session_id lifecycle / boundary clears ------------------------
+#
+# Round-5 codex finding (HIGH, conf 0.88): the schema persists one
+# activation per session_key, but the gateway switches the same
+# session_key to a different session_id via /resume, /branch, and
+# compression_exhausted reset. Without an explicit clear at those
+# boundaries, a stale active_project from the OLD session_id is applied
+# to the NEW transcript on the next read.
+#
+# Option B (chosen): keep PK = session_key, add clear_activation() calls
+# at all logical-session boundaries: /resume, /branch, compression_exhausted.
+# (Hygiene compression is NOT a boundary — same logical session.)
+
+
+def test_session_id_change_does_not_apply_stale_project(
+    tmp_db: Path,
+) -> None:
+    """OQ-30 core invariant: writing activation while bound to session A,
+    then switching the same session_key's session_id to B, must NOT cause
+    the recompute resolver to apply A's project to B.
+
+    With Option B + clear_activation hooks, this is enforced by clearing
+    the row at the boundary, so the recompute returns None for B.
+    """
+    from gateway import skill_state_db as db
+    skey = "agent:main:telegram:dm:lifecycle-1"
+
+    # Activation under session_id A.
+    db.record_activation(
+        skey, "maestro-A", project="A", channel_id="c", db_path=tmp_db,
+    )
+    assert db.get_activation(skey, db_path=tmp_db) is not None
+
+    # Boundary fires (e.g. /resume): the gateway calls clear_activation().
+    db.clear_activation(skey, db_path=tmp_db)
+
+    # Now the session_key's session_id has logically switched to B.
+    # The resolver must NOT return A's project for B's turn.
+    persisted = db.get_activation(skey, db_path=tmp_db)
+    assert persisted is None, (
+        "stale activation from session_id A is still applied to "
+        "session_id B for the same session_key — OQ-30 cross-session leak"
+    )
+
+
+def test_runner_clear_session_activation_helper_drops_db_and_cache(
+    tmp_db: Path,
+) -> None:
+    """The runner-level helper _clear_session_activation(session_key)
+    must drop BOTH the in-memory _session_skill_context cache entry AND
+    the durable DB row.  Forgetting either re-opens the leak.
+    """
+    from gateway import skill_state_db as db
+    from gateway.run import GatewayRunner
+
+    skey = "agent:main:telegram:dm:helper-1"
+    db.record_activation(skey, "maestro-h", project="h", db_path=tmp_db)
+    assert db.get_activation(skey, db_path=tmp_db) is not None
+
+    runner = object.__new__(GatewayRunner)
+    runner._session_skill_context = {
+        skey: {"active_skill": "maestro-h", "channel_id": None, "project": "h"}
+    }
+
+    # Patch the DB path resolution by monkeypatching the function the
+    # helper calls.  We use the real clear_activation() via the helper.
+    import gateway.skill_state_db as ssdb_mod
+    original_clear = ssdb_mod.clear_activation
+
+    def _clear(session_key, **kw):
+        # Force the test DB regardless of caller.
+        return original_clear(session_key, db_path=tmp_db)
+
+    try:
+        ssdb_mod.clear_activation = _clear
+        runner._clear_session_activation(skey)
+    finally:
+        ssdb_mod.clear_activation = original_clear
+
+    assert skey not in runner._session_skill_context, (
+        "_clear_session_activation did NOT drop the in-memory cache entry"
+    )
+    assert db.get_activation(skey, db_path=tmp_db) is None, (
+        "_clear_session_activation did NOT delete the DB row"
+    )

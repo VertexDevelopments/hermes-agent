@@ -691,8 +691,17 @@ def test_gateway_wires_apply_skill_context_per_turn():
     assert "_skill_ctx_dict[session_key]" in src
     # Applied to agent each turn (per-message setter call).
     assert "agent.apply_skill_context" in src
-    # Cleared on session reset so a new session starts clean.
-    assert "_skill_ctx_dict.pop(session_key" in src
+    # Cleared on session reset (and on /resume, /branch, compression_exhausted —
+    # all logical-session boundaries) so a new session starts clean.  The
+    # cache.pop and the durable DB clear are now centralised in the
+    # _clear_session_activation helper (D-013 round-5 OQ-30 fix).
+    assert "_clear_session_activation" in src, (
+        "gateway must clear in-memory + durable activation state at "
+        "session boundaries (round-10 finding #1 + OQ-30)"
+    )
+    assert "skill_ctx.pop(session_key" in src or "_skill_ctx_dict.pop(session_key" in src, (
+        "the activation-clear helper must drop the in-memory cache entry"
+    )
 
 
 def test_gateway_does_not_reintroduce_transcript_regex_recovery():

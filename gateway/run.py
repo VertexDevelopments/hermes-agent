@@ -4848,6 +4848,12 @@ class GatewayRunner:
                 self.session_store.reset_session(session_key)
                 self._evict_cached_agent(session_key)
                 self._session_model_overrides.pop(session_key, None)
+                # OQ-30 (D-013 round-5 HIGH): the auto-reset rotates
+                # session_id under the same session_key, so the
+                # slash-skill activation row + cache MUST be dropped to
+                # prevent the persisted active_project from leaking into
+                # the fresh session that the user's next message starts.
+                self._clear_session_activation(session_key)
                 response = (response or "") + (
                     "\n\n🔄 Session auto-reset — the conversation exceeded the "
                     "maximum context size and could not be compressed further. "
@@ -5136,24 +5142,11 @@ class GatewayRunner:
         # the configured default instead of the previously switched model.
         self._session_model_overrides.pop(session_key, None)
         # Clear active skill context so a new session starts with no
-        # auto_skill projection (codex round-10 finding #1).  Guard via
-        # getattr because test fixtures may construct runners without
-        # going through __init__.
-        _skill_ctx_dict = getattr(self, "_session_skill_context", None)
-        if isinstance(_skill_ctx_dict, dict):
-            _skill_ctx_dict.pop(session_key, None)
-        # OQ-28: also drop the durable activations DB row. Without this
-        # the next turn would re-populate the in-memory cache from the
-        # stale persisted activation, defeating the /new|/reset boundary
-        # (and re-opening the spoofing surface for any subsequent turn).
-        try:
-            from gateway import skill_state_db as _ssdb
-            _ssdb.clear_activation(session_key)
-        except Exception as _clear_db_err:
-            logger.debug(
-                "[Gateway] activation DB clear failed (non-fatal): %s",
-                _clear_db_err,
-            )
+        # auto_skill projection (codex round-10 finding #1) — and drop
+        # the durable activations DB row so the next turn doesn't
+        # re-populate the in-memory cache from a stale persisted
+        # activation (OQ-28 round-4 + OQ-30 round-5).
+        self._clear_session_activation(session_key)
 
         # Clear session-scoped dangerous-command approvals and /yolo state.
         # /new is a conversation-boundary operation — approval state from the
@@ -7409,6 +7402,11 @@ class GatewayRunner:
         if not new_entry:
             return "Failed to switch session."
         self._clear_session_boundary_security_state(session_key)
+        # OQ-30 (D-013 round-5 HIGH): /resume swaps the session_id under
+        # the same session_key.  Drop the slash-skill activation so the
+        # resumed session does NOT inherit a stale active_project from
+        # the session that was just left behind.
+        self._clear_session_activation(session_key)
 
         # Get the title for confirmation
         title = self._session_db.get_session_title(target_id) or name
@@ -7499,6 +7497,11 @@ class GatewayRunner:
         if not new_entry:
             return "Branch created but failed to switch to it."
         self._clear_session_boundary_security_state(session_key)
+        # OQ-30 (D-013 round-5 HIGH): /branch creates an independent
+        # session_id under the same session_key.  Drop the slash-skill
+        # activation so the new branch starts fresh (no inherited
+        # active_project).
+        self._clear_session_activation(session_key)
 
         # Evict any cached agent for this session
         self._evict_cached_agent(session_key)
@@ -8889,6 +8892,45 @@ class GatewayRunner:
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
         return True
+
+    def _clear_session_activation(self, session_key: str) -> None:
+        """Drop slash-skill activation state at a logical-session boundary.
+
+        Wipes BOTH:
+          1. The in-memory ``_session_skill_context`` cache entry
+             (otherwise the cache shadows an empty DB on the next read).
+          2. The durable ``slash_skill_activations`` row in
+             ``HERMES_HOME/state/gateway_sessions.db``.
+
+        Call from every site where the same ``session_key`` switches to
+        a different ``session_id``: ``/reset`` / ``/new``, ``/resume``,
+        ``/branch``, and the ``compression_exhausted`` auto-reset path.
+        Without this, the persisted ``active_project`` from session_id A
+        would be applied to a different transcript / session_id B sharing
+        the same session_key — the OQ-30 (D-013 round-5, HIGH) leak.
+
+        NOT called from in-turn hygiene compression
+        (``_compress_context``-driven session_id rotation): those paths
+        are mid-turn within the same logical session and must keep the
+        activation.
+        """
+        if not session_key:
+            return
+        # 1) In-memory cache.  Guard via getattr so test fixtures that
+        # construct runners without going through __init__ don't blow up.
+        skill_ctx = getattr(self, "_session_skill_context", None)
+        if isinstance(skill_ctx, dict):
+            skill_ctx.pop(session_key, None)
+        # 2) Durable DB row.  Best-effort: never raise out of a session
+        # boundary handler over a sqlite hiccup.
+        try:
+            from gateway import skill_state_db as _ssdb
+            _ssdb.clear_activation(session_key)
+        except Exception as _clear_db_err:
+            logger.debug(
+                "[Gateway] activation DB clear failed (non-fatal): %s",
+                _clear_db_err,
+            )
 
     def _clear_session_boundary_security_state(self, session_key: str) -> None:
         """Clear approval state that must not survive a real conversation switch."""
