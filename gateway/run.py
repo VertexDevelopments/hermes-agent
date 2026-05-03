@@ -3844,15 +3844,36 @@ class GatewayRunner:
                                 _project_tag = _skill_name.split("/")[-1].replace(
                                     "maestro-", "", 1
                                 )
+                                _channel_id_str = (
+                                    str(source.chat_id)
+                                    if source.chat_id is not None
+                                    else None
+                                )
                                 _skill_ctx_dict[_quick_key] = {
                                     "active_skill": _skill_name,
-                                    "channel_id": (
-                                        str(source.chat_id)
-                                        if source.chat_id is not None
-                                        else None
-                                    ),
+                                    "channel_id": _channel_id_str,
                                     "project": _project_tag,
                                 }
+                                # OQ-28: write-through to durable activations
+                                # DB so the next turn after a gateway restart
+                                # can resolve active_skill/active_project from
+                                # trusted structured state, not from transcript
+                                # text (which would be spoofable by the user).
+                                try:
+                                    from gateway import skill_state_db as _ssdb
+                                    _ssdb.record_activation(
+                                        _quick_key,
+                                        _skill_name,
+                                        channel_id=_channel_id_str,
+                                        project=_project_tag,
+                                        source="slash",
+                                    )
+                                except Exception as _slash_db_err:
+                                    logger.debug(
+                                        "[Gateway] slash-skill DB persist failed "
+                                        "(non-fatal): %s",
+                                        _slash_db_err,
+                                    )
                         except Exception as _slash_ctx_err:
                             logger.debug(
                                 "[Gateway] slash-skill context update failed "
@@ -4229,12 +4250,30 @@ class GatewayRunner:
                 _primary = _skill_names[0]
                 _project_tag = _primary.split("/")[-1].replace("maestro-", "", 1)
                 _skill_ctx_dict = getattr(self, "_session_skill_context", None)
+                _channel_id_str = str(source.chat_id) if source.chat_id is not None else None
                 if isinstance(_skill_ctx_dict, dict):
                     _skill_ctx_dict[session_key] = {
                         "active_skill": _primary,
-                        "channel_id": str(source.chat_id) if source.chat_id is not None else None,
+                        "channel_id": _channel_id_str,
                         "project": _project_tag,
                     }
+                # OQ-28: write-through to durable activations DB. Auto_skill
+                # is also a trusted source (resolved from channel binding,
+                # not from user message text), so it earns a row.
+                try:
+                    from gateway import skill_state_db as _ssdb
+                    _ssdb.record_activation(
+                        session_key,
+                        _primary,
+                        channel_id=_channel_id_str,
+                        project=_project_tag,
+                        source="auto_skill",
+                    )
+                except Exception as _auto_db_err:
+                    logger.debug(
+                        "[Gateway] auto_skill DB persist failed (non-fatal): %s",
+                        _auto_db_err,
+                    )
             except Exception as e:
                 logger.warning(
                     "[Gateway] Failed to populate skill context for %s: %s",
@@ -5103,6 +5142,18 @@ class GatewayRunner:
         _skill_ctx_dict = getattr(self, "_session_skill_context", None)
         if isinstance(_skill_ctx_dict, dict):
             _skill_ctx_dict.pop(session_key, None)
+        # OQ-28: also drop the durable activations DB row. Without this
+        # the next turn would re-populate the in-memory cache from the
+        # stale persisted activation, defeating the /new|/reset boundary
+        # (and re-opening the spoofing surface for any subsequent turn).
+        try:
+            from gateway import skill_state_db as _ssdb
+            _ssdb.clear_activation(session_key)
+        except Exception as _clear_db_err:
+            logger.debug(
+                "[Gateway] activation DB clear failed (non-fatal): %s",
+                _clear_db_err,
+            )
 
         # Clear session-scoped dangerous-command approvals and /yolo state.
         # /new is a conversation-boundary operation — approval state from the
@@ -9991,6 +10042,36 @@ class GatewayRunner:
             try:
                 _skill_ctx_dict = getattr(self, "_session_skill_context", None)
                 _skill_ctx = (_skill_ctx_dict.get(session_key) or {}) if isinstance(_skill_ctx_dict, dict) else {}
+                # OQ-28 cold-path recovery: when the in-memory cache is
+                # empty (e.g. first turn after a gateway restart, or any
+                # session_key the cache hasn't seen yet) read the trusted
+                # activation row from gateway_sessions.db.  This replaces
+                # round-3 H2's transcript-regex fallback (reverted in
+                # 864bf1fb2) with structured persisted state — not derived
+                # from any user-controllable text.  If the DB row is also
+                # absent, fall through to the original predictable
+                # default (None / chat_id only); the gate then fails
+                # safely without inventing a project context.
+                if not _skill_ctx:
+                    try:
+                        from gateway import skill_state_db as _ssdb
+                        _persisted = _ssdb.get_activation(session_key)
+                    except Exception as _ssdb_err:
+                        logger.debug(
+                            "[Gateway] activation DB read failed (non-fatal): %s",
+                            _ssdb_err,
+                        )
+                        _persisted = None
+                    if _persisted:
+                        _skill_ctx = {
+                            "active_skill": _persisted.get("active_skill"),
+                            "channel_id":   _persisted.get("channel_id"),
+                            "project":      _persisted.get("project"),
+                        }
+                        # Warm the in-memory cache so subsequent turns
+                        # don't re-hit SQLite.
+                        if isinstance(_skill_ctx_dict, dict):
+                            _skill_ctx_dict[session_key] = dict(_skill_ctx)
                 if hasattr(agent, "apply_skill_context"):
                     agent.apply_skill_context(
                         active_skill=_skill_ctx.get("active_skill"),
