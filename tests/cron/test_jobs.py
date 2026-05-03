@@ -369,6 +369,87 @@ class TestMarkJobRun:
         assert updated["last_error"] == "model timeout"
         assert updated["last_delivery_error"] == "platform 'discord' not enabled"
 
+    def test_recurring_cron_not_silent_disabled_when_compute_fails(self, tmp_cron_dir, caplog):
+        """OQ-25: a recurring cron job whose compute_next_run returns None
+        (e.g. croniter missing) MUST NOT be silently disabled.
+
+        Previous behaviour: the job fired once successfully, mark_job_run
+        called compute_next_run, the cron-kind branch returned None
+        because HAS_CRONITER was False, mark_job_run treated that as
+        "one-shot completed" and flipped enabled=False.  Net effect: a
+        daily-brief job ran exactly once and then vanished from the
+        active list, with no warning in the gateway log.
+        """
+        pytest.importorskip("croniter")  # need it to create the job in the first place
+        job = create_job(prompt="Daily brief", schedule="0 9 * * *", name="daily-brief")
+        assert job["enabled"] is True
+
+        # Simulate the broken state — compute_next_run returns None as
+        # though croniter were unavailable.  We intentionally patch the
+        # compute_next_run reference inside cron.jobs (not the import in
+        # this test module) so mark_job_run uses the patched version.
+        with patch("cron.jobs.compute_next_run", return_value=None):
+            with caplog.at_level("WARNING", logger="cron.jobs"):
+                mark_job_run(job["id"], success=True)
+
+        updated = get_job(job["id"])
+        assert updated is not None, "job was deleted — must remain in registry"
+        assert updated["enabled"] is True, (
+            "recurring cron job was silently disabled when next_run_at "
+            "could not be computed (OQ-25 regression)"
+        )
+        assert updated["state"] == "error", (
+            "state should surface the failure so `hermes cron list` "
+            "shows it, not silently mark the job 'completed'"
+        )
+        assert updated["last_status"] == "ok"  # the run itself succeeded
+        # And the operator must see SOMETHING in the log
+        warning_text = " ".join(rec.message for rec in caplog.records)
+        assert "compute_next_run returned None" in warning_text
+
+    def test_recurring_interval_not_silent_disabled_when_compute_fails(self, tmp_cron_dir, caplog):
+        """Same protection applies to interval-kind schedules — they're
+        recurring too, so a None return from compute_next_run is a bug,
+        not a one-shot completion."""
+        job = create_job(prompt="Heartbeat", schedule="every 1h")
+        assert (job.get("schedule") or {}).get("kind") == "interval"
+
+        with patch("cron.jobs.compute_next_run", return_value=None):
+            with caplog.at_level("WARNING", logger="cron.jobs"):
+                mark_job_run(job["id"], success=True)
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["enabled"] is True
+        assert updated["state"] == "error"
+
+    def test_oneshot_still_disables_on_completion(self, tmp_cron_dir):
+        """The OQ-25 fix must not regress the legitimate one-shot path:
+        a `kind == "once"` job whose run_at has passed SHOULD be
+        disabled and marked completed once mark_job_run sees a None
+        next_run_at."""
+        # Use a one-shot schedule whose run_at is well in the past so
+        # _recoverable_oneshot_run_at returns None on the second compute.
+        # Easiest: create the job, then patch compute_next_run to None
+        # exactly once for a kind="once" job.
+        job = create_job(prompt="Send report", schedule="30m")
+        assert (job.get("schedule") or {}).get("kind") == "once"
+
+        with patch("cron.jobs.compute_next_run", return_value=None):
+            mark_job_run(job["id"], success=True)
+
+        updated = get_job(job["id"])
+        # repeat default is times=1 so the job is actually deleted, not
+        # just disabled — but if a caller created it with repeat=None or
+        # the deletion path was skipped, the disable+completed branch is
+        # still the right behaviour for one-shots.  Either deleted
+        # (None) or disabled+completed is acceptable here; what's NOT
+        # acceptable is enabled=True, which is what the recurring path
+        # now produces.
+        if updated is not None:
+            assert updated["enabled"] is False
+            assert updated["state"] == "completed"
+
 
 class TestAdvanceNextRun:
     """Tests for advance_next_run() — crash-safety for recurring jobs."""

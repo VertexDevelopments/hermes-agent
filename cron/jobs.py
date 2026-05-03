@@ -634,10 +634,47 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
 
-                # If no next run (one-shot completed), disable
+                # No next_run_at can mean two very different things and we
+                # MUST not conflate them (OQ-25):
+                #
+                #   1. one-shot ``kind == "once"`` job that has fired —
+                #      disabling is the correct terminal state.
+                #   2. recurring ``kind in ("cron", "interval")`` job where
+                #      compute_next_run could not produce a timestamp.  In
+                #      practice this only happens when croniter is missing
+                #      from the runtime (see OQ-24) or the schedule dict
+                #      was hand-edited to something invalid.  Disabling
+                #      silently here was the bug: it turned a fixable
+                #      dependency gap into "my recurring job ran exactly
+                #      once and then vanished" with no log line.
+                schedule_kind = (job.get("schedule") or {}).get("kind")
                 if job["next_run_at"] is None:
-                    job["enabled"] = False
-                    job["state"] = "completed"
+                    if schedule_kind in ("cron", "interval"):
+                        # Surface the failure: keep enabled True so the
+                        # operator sees the job in `hermes cron list`,
+                        # mark state="error" so the [active]/[paused] UI
+                        # renders a distinct status, and emit a WARNING
+                        # the gateway log will pick up on the very next
+                        # tick.  The job will retry on subsequent ticks
+                        # once the underlying issue is fixed.
+                        logger.warning(
+                            "mark_job_run: compute_next_run returned None for "
+                            "recurring job %s (kind=%s, schedule=%s) — leaving "
+                            "enabled so the failure is visible; check that the "
+                            "'croniter' package is installed and the schedule "
+                            "expression is valid",
+                            job_id, schedule_kind, job.get("schedule"),
+                        )
+                        job["state"] = "error"
+                        job["last_error"] = (
+                            "compute_next_run returned None — schedule could "
+                            "not be advanced (croniter missing or invalid expr)"
+                        )
+                    else:
+                        # Genuine one-shot completion (kind == "once" or
+                        # legacy/unknown kind that can't recur).
+                        job["enabled"] = False
+                        job["state"] = "completed"
                 elif job.get("state") != "paused":
                     job["state"] = "scheduled"
 
