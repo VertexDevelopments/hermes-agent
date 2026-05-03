@@ -694,6 +694,16 @@ class GatewayRunner:
         # This preserves write_frequency="session" semantics across short-lived
         # per-message AIAgent instances.
 
+        # Per-session active skill context (codex round-10 finding #1).
+        # Populated when an auto_skill loads for the session and applied to
+        # AIAgent each turn so the pre_memory_write hook receives non-null
+        # active_skill / channel_id / project (project-confidentiality
+        # plugins need this to make policy decisions).
+        # Key: session_key, Value: {"active_skill": str, "channel_id": str,
+        # "project": str}.  Survives the per-message agent rebuild because
+        # ongoing sessions keep the skill loaded in their conversation history.
+        self._session_skill_context: Dict[str, Dict[str, Optional[str]]] = {}
+
 
 
         # Ensure tirith security scanner is available (downloads if needed)
@@ -4195,6 +4205,20 @@ class GatewayRunner:
                         "[Gateway] Auto-loaded skill(s) %s for session %s",
                         _loaded_names, session_key,
                     )
+                    # Persist active skill context for pre_memory_write hooks
+                    # (codex round-10 finding #1).  Project tag is derived from
+                    # the first loaded skill — most channel-bound auto_skill
+                    # configurations load a single project skill.  Plugins that
+                    # need richer context can still fall back to the session file.
+                    _primary = _loaded_names[0]
+                    _project_tag = _primary.split("/")[-1].replace("maestro-", "", 1)
+                    _skill_ctx_dict = getattr(self, "_session_skill_context", None)
+                    if isinstance(_skill_ctx_dict, dict):
+                        _skill_ctx_dict[session_key] = {
+                            "active_skill": _primary,
+                            "channel_id": str(source.chat_id) if source.chat_id is not None else None,
+                            "project": _project_tag,
+                        }
             except Exception as e:
                 logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
@@ -5022,6 +5046,13 @@ class GatewayRunner:
         # Clear any session-scoped model override so the next agent picks up
         # the configured default instead of the previously switched model.
         self._session_model_overrides.pop(session_key, None)
+        # Clear active skill context so a new session starts with no
+        # auto_skill projection (codex round-10 finding #1).  Guard via
+        # getattr because test fixtures may construct runners without
+        # going through __init__.
+        _skill_ctx_dict = getattr(self, "_session_skill_context", None)
+        if isinstance(_skill_ctx_dict, dict):
+            _skill_ctx_dict.pop(session_key, None)
 
         # Clear session-scoped dangerous-command approvals and /yolo state.
         # /new is a conversation-boundary operation — approval state from the
@@ -9901,6 +9932,23 @@ class GatewayRunner:
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides")
+
+            # Apply per-session active skill context for the pre_memory_write
+            # hook (codex round-10 finding #1).  Cached agents are reused
+            # across turns so this MUST run every message — the user may
+            # switch skills mid-session via /skill.  Falls back to clearing
+            # all fields when no auto_skill is recorded.
+            try:
+                _skill_ctx_dict = getattr(self, "_session_skill_context", None)
+                _skill_ctx = (_skill_ctx_dict.get(session_key) or {}) if isinstance(_skill_ctx_dict, dict) else {}
+                if hasattr(agent, "apply_skill_context"):
+                    agent.apply_skill_context(
+                        active_skill=_skill_ctx.get("active_skill"),
+                        channel_id=_skill_ctx.get("channel_id") or (str(source.chat_id) if source.chat_id is not None else None),
+                        project=_skill_ctx.get("project"),
+                    )
+            except Exception as _ctx_err:
+                logger.debug("[Gateway] skill context apply failed (non-fatal): %s", _ctx_err)
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []

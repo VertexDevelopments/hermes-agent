@@ -2302,6 +2302,33 @@ class AIAgent:
             "api_mode": getattr(self, "api_mode", "") or "",
         }
 
+    def apply_skill_context(
+        self,
+        *,
+        active_skill: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        project: Optional[str] = None,
+    ) -> None:
+        """Populate the per-session skill/channel/project context that
+        ``pre_memory_write`` plugin hooks read via ``_current_skill_context``.
+
+        Codex round-10 finding #1: prior code declared ``_current_skill_context``
+        but never assigned the underlying ``_active_skill_name`` /
+        ``_active_channel_id`` / ``_active_project`` attributes from the
+        gateway path.  Hooks received only None — a project-confidentiality
+        guard couldn't distinguish projects, leading to either cross-project
+        memory leaks or over-blocking everything.
+
+        Gateway turn loop calls this every message after resolving the
+        per-session active skill (see ``_loaded_names`` in ``gateway/run.py``).
+        Cached agents are reused across turns so this MUST be called per turn,
+        not once at construction — the user may switch skills mid-session.
+        Passing ``None`` for any field clears that field.
+        """
+        self._active_skill_name = active_skill or None
+        self._active_channel_id = channel_id or None
+        self._active_project = project or None
+
     def _current_skill_context(self) -> Dict[str, Any]:
         """Return the active-skill context for plugin hooks.
 
