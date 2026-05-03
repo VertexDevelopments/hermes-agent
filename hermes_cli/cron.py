@@ -77,6 +77,17 @@ def cron_list(show_all: bool = False):
             status = color("[paused]", Colors.YELLOW)
         elif state == "completed":
             status = color("[completed]", Colors.BLUE)
+        elif state == "error":
+            # OQ-33: surface OQ-25's recoverable-error state distinctly from
+            # [active] / [disabled].  The job is still enabled and will retry
+            # on the next tick; the operator just needs to see the failure.
+            err_excerpt = str(job.get("last_error") or "").strip()
+            if len(err_excerpt) > 80:
+                err_excerpt = err_excerpt[:77] + "..."
+            if err_excerpt:
+                status = color(f"[error] {err_excerpt}", Colors.RED)
+            else:
+                status = color("[error]", Colors.RED)
         elif job.get("enabled", True):
             status = color("[active]", Colors.GREEN)
         else:

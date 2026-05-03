@@ -5,7 +5,7 @@ from argparse import Namespace
 import pytest
 
 from cron.jobs import create_job, get_job, list_jobs
-from hermes_cli.cron import cron_command
+from hermes_cli.cron import cron_command, cron_list
 
 
 @pytest.fixture()
@@ -105,3 +105,98 @@ class TestCronCommandLifecycle:
         assert len(jobs) == 1
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
+
+
+def _stub_list_jobs(jobs):
+    def _inner(include_disabled=False):
+        return list(jobs)
+    return _inner
+
+
+def _stub_no_gateway(monkeypatch):
+    """cron_list calls find_gateway_pids at the bottom; stub it out so the
+    test doesn't depend on whether a gateway happens to be running on the
+    machine running pytest."""
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [1])
+
+
+class TestCronListErrorRendering:
+    """OQ-33: cron list must render state=='error' distinctly from [active]."""
+
+    def test_error_state_renders_with_excerpt(self, monkeypatch, capsys):
+        job = {
+            "id": "abc12345",
+            "name": "Recurring with broken croniter",
+            "schedule": {"value": "0 9 * * *", "kind": "cron"},
+            "schedule_display": "0 9 * * *",
+            "next_run_at": "2026-05-04T09:00:00Z",
+            "enabled": True,
+            "state": "error",
+            "last_error": "compute_next_run returned None — schedule could not be advanced",
+            "deliver": ["local"],
+            "repeat": {},
+        }
+        monkeypatch.setattr("cron.jobs.list_jobs", _stub_list_jobs([job]))
+        _stub_no_gateway(monkeypatch)
+
+        cron_list()
+        out = capsys.readouterr().out
+
+        assert "[error]" in out
+        # excerpt portion should appear next to the [error] tag
+        assert "compute_next_run returned None" in out
+        # must NOT regress to [active] for an error-state job
+        assert "[active]" not in out
+
+    def test_missing_state_falls_back_to_active(self, monkeypatch, capsys):
+        # Legacy jobs persisted without a 'state' field default to scheduled
+        # via the cron_list fallback (state = "scheduled" if enabled).  This
+        # guards against accidentally breaking pre-OQ-25 jobs.json files.
+        job = {
+            "id": "legacy01",
+            "name": "Pre-OQ-25 job",
+            "schedule": {"value": "every 1h", "kind": "interval"},
+            "schedule_display": "every 60m",
+            "next_run_at": "2026-05-03T13:00:00Z",
+            "enabled": True,
+            # no "state" key
+            "deliver": ["local"],
+            "repeat": {},
+        }
+        monkeypatch.setattr("cron.jobs.list_jobs", _stub_list_jobs([job]))
+        _stub_no_gateway(monkeypatch)
+
+        cron_list()
+        out = capsys.readouterr().out
+
+        assert "[active]" in out
+        assert "[error]" not in out
+
+    def test_long_last_error_is_truncated(self, monkeypatch, capsys):
+        long_msg = "x" * 200
+        job = {
+            "id": "longerr0",
+            "name": "Very loud failure",
+            "schedule": {"value": "*/5 * * * *", "kind": "cron"},
+            "schedule_display": "*/5 * * * *",
+            "next_run_at": "2026-05-03T13:05:00Z",
+            "enabled": True,
+            "state": "error",
+            "last_error": long_msg,
+            "deliver": ["local"],
+            "repeat": {},
+        }
+        monkeypatch.setattr("cron.jobs.list_jobs", _stub_list_jobs([job]))
+        _stub_no_gateway(monkeypatch)
+
+        cron_list()
+        out = capsys.readouterr().out
+
+        assert "[error]" in out
+        assert "..." in out
+        # the full 200-char message must NOT appear verbatim — that would
+        # blow up list-view width.  Truncated form is 77 chars + "...".
+        assert long_msg not in out
+        assert "x" * 77 in out
+
+
