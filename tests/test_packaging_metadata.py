@@ -20,3 +20,26 @@ def test_manifest_includes_bundled_skills():
 
     assert "graft skills" in manifest
     assert "graft optional-skills" in manifest
+
+
+def test_croniter_is_a_base_dependency():
+    """OQ-24: croniter must be a runtime dep, not just an extra.
+
+    The gateway imports cron.scheduler unconditionally at startup, and
+    cron.jobs.compute_next_run silently returns None for cron-kind
+    schedules when croniter is missing — which causes mark_job_run to
+    flip ``enabled`` to False after the first fire.  Keeping croniter in
+    [cron] *only* meant a fresh install would create the bug, with the
+    failure mode being a one-shot disable rather than an ImportError.
+    """
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    deps = data["project"]["dependencies"]
+
+    assert any(dep.startswith("croniter") for dep in deps), (
+        "croniter must be in [project].dependencies — see OQ-24"
+    )
+
+    # Keep it in the [cron] extra too: removing would be a breaking change
+    # for anyone pinning hermes-agent[cron] in their own constraints files.
+    cron_extra = data["project"]["optional-dependencies"]["cron"]
+    assert any(dep.startswith("croniter") for dep in cron_extra)
