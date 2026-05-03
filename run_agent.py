@@ -677,6 +677,139 @@ def _qwen_portal_headers() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Memory provider tool classifier (codex round-10 finding #3).
+#
+# External MemoryProvider tools (hindsight_*, supermemory_*, fact_store,
+# fact_feedback, etc.) are dispatched through MemoryManager.handle_tool_call
+# WITHOUT routing through the built-in memory tool gate.  pre_tool_call can
+# only block by tool name — it cannot inspect content/action semantics.
+# This classifier maps a provider tool + args to a normalized memory action
+# ("add" | "replace" | "remove") that the pre_memory_write hook understands,
+# or returns None if the tool is read-only and should not be gated.
+#
+# Naming heuristic: any tool with a write-style suffix is a mutation.  Tools
+# that take an ``action`` enum argument (fact_store, fact_feedback) are
+# dispatched by that action.  Read-only patterns (search/recall/reflect/
+# probe/related/reason/contradict/list/profile) explicitly return None.
+# ---------------------------------------------------------------------------
+
+_PROVIDER_TOOL_WRITE_SUFFIXES = (
+    "_store", "_retain", "_remember", "_save", "_capture", "_write",
+)
+_PROVIDER_TOOL_DELETE_SUFFIXES = ("_forget", "_delete", "_remove")
+_PROVIDER_TOOL_READ_PATTERNS = (
+    "_search", "_recall", "_reflect", "_profile", "_query",
+    "_lookup", "_get", "_fetch",
+)
+# fact_store ``action`` enum → normalised memory action.
+_FACT_STORE_ACTION_MAP = {
+    "add": "add",
+    "update": "replace",
+    "remove": "remove",
+    # read-only actions return None below.
+}
+_FACT_STORE_READ_ACTIONS = (
+    "search", "probe", "related", "reason", "contradict", "list",
+)
+
+
+def _classify_provider_memory_tool_action(
+    tool_name: str,
+    function_args: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """Return ``"add" | "replace" | "remove"`` if ``tool_name`` mutates
+    provider memory, else ``None``.
+
+    None means "no gate" — either the tool is read-only or it is not a
+    memory provider tool at all.  Caller should still check
+    ``MemoryManager.has_tool(tool_name)`` to confirm provider ownership.
+    """
+    if not isinstance(tool_name, str) or not tool_name:
+        return None
+    args = function_args if isinstance(function_args, dict) else {}
+
+    # action-dispatched tools first (fact_store / fact_feedback).
+    if tool_name == "fact_store":
+        action = str(args.get("action") or "").lower()
+        if action in _FACT_STORE_READ_ACTIONS:
+            return None
+        return _FACT_STORE_ACTION_MAP.get(action)
+    if tool_name == "fact_feedback":
+        # Both helpful/unhelpful adjust trust scores → mutation.
+        # Use "replace" — closest to "modifying existing fact metadata".
+        return "replace"
+
+    lower = tool_name.lower()
+    # Explicit read-only patterns short-circuit before write-suffix check
+    # (a hypothetical "memory_search_store" stays read because search wins).
+    for pat in _PROVIDER_TOOL_READ_PATTERNS:
+        if lower.endswith(pat):
+            return None
+    for suf in _PROVIDER_TOOL_DELETE_SUFFIXES:
+        if lower.endswith(suf):
+            return "remove"
+    for suf in _PROVIDER_TOOL_WRITE_SUFFIXES:
+        if lower.endswith(suf):
+            return "add"
+    return None
+
+
+def _gate_provider_memory_tool(
+    self_agent: Any,
+    tool_name: str,
+    function_args: Dict[str, Any],
+) -> Optional[str]:
+    """Run pre_memory_write for a mutating provider tool.
+
+    Returns a block reason string when the gate refuses, ``None`` when the
+    write is permitted or the tool is read-only.  Fail-closed on helper
+    ImportError (returns a descriptive block message).
+    """
+    action = _classify_provider_memory_tool_action(tool_name, function_args)
+    if action is None:
+        return None  # read-only or unrecognised → no gate
+
+    try:
+        from hermes_cli.plugins import (
+            get_pre_memory_write_block_message as _gate,
+        )
+    except ImportError as _import_err:
+        logger.error(
+            "provider memory tool %s: pre_memory_write helper unavailable "
+            "(%s); REFUSING memory write fail-closed",
+            tool_name, _import_err,
+        )
+        return (
+            f"Memory write blocked: pre_memory_write helper unavailable for "
+            f"provider tool '{tool_name}' ({_import_err})"
+        )
+
+    # Pull a content-ish payload for the gate to inspect.  Different
+    # provider tools spell it differently; pick the most informative
+    # field rather than serializing the whole arg blob (keeps content-
+    # policy plugins simple).
+    content = (
+        function_args.get("content")
+        or function_args.get("text")
+        or function_args.get("payload")
+    )
+    old_text = (
+        function_args.get("old_text")
+        or function_args.get("id")
+        or function_args.get("query")
+    )
+    return _gate(
+        action=action,
+        target=tool_name,
+        content=content if isinstance(content, str) else None,
+        old_text=old_text if isinstance(old_text, str) else None,
+        write_path="provider_tool",
+        session_id=getattr(self_agent, "session_id", None),
+        skill_context=self_agent._current_skill_context(),
+    )
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -7889,6 +8022,14 @@ class AIAgent:
                     logger.error("memory bridge: pre_memory_write helper unavailable; bridge skipped")
             return result
         elif self._memory_manager and self._memory_manager.has_tool(function_name):
+            # Provider memory tools (hindsight_*, supermemory_*, fact_store, ...)
+            # must run pre_memory_write for mutating actions.  Codex round-10
+            # finding #3: prior code routed straight to handle_tool_call so
+            # plugins could not block content for external persistent writes.
+            _provider_block = _gate_provider_memory_tool(self, function_name, function_args)
+            if _provider_block:
+                logger.info("provider memory tool %s blocked by plugin: %s", function_name, _provider_block)
+                return json.dumps({"error": _provider_block}, ensure_ascii=False)
             return self._memory_manager.handle_tool_call(function_name, function_args)
         elif function_name == "clarify":
             from tools.clarify_tool import clarify_tool as _clarify_tool
@@ -8516,8 +8657,19 @@ class AIAgent:
                     spinner.start()
                 _mem_result = None
                 try:
-                    function_result = self._memory_manager.handle_tool_call(function_name, function_args)
-                    _mem_result = function_result
+                    # pre_memory_write gate for provider tools (codex
+                    # round-10 finding #3).  Read-only tools fall through.
+                    _provider_block_alt = _gate_provider_memory_tool(self, function_name, function_args)
+                    if _provider_block_alt:
+                        logger.info(
+                            "provider memory tool %s (alt path) blocked by plugin: %s",
+                            function_name, _provider_block_alt,
+                        )
+                        function_result = json.dumps({"error": _provider_block_alt}, ensure_ascii=False)
+                        _mem_result = function_result
+                    else:
+                        function_result = self._memory_manager.handle_tool_call(function_name, function_args)
+                        _mem_result = function_result
                 except Exception as tool_error:
                     function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
                     logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)

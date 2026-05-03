@@ -602,6 +602,178 @@ def test_helper_blocks_when_hook_callback_raises():
 
 
 # -----------------------------------------------------------------------------
+# Codex finding #3 (HIGH): provider memory write tools bypass pre_memory_write.
+#
+# ``self._memory_manager.handle_tool_call(...)`` is invoked unguarded for
+# provider tools (hindsight_retain, supermemory_store, supermemory_forget,
+# fact_store add/update/remove).  Content policy in pre_memory_write never
+# saw these external persistent writes.  pre_tool_call blocks by tool name
+# only — it cannot inspect content/action semantics.
+# -----------------------------------------------------------------------------
+
+
+def _classifier():
+    from run_agent import _classify_provider_memory_tool_action
+    return _classify_provider_memory_tool_action
+
+
+def test_provider_tool_classifier_identifies_writes():
+    classify = _classifier()
+    # Read-only tools → None (no gate).
+    assert classify("hindsight_recall", {}) is None
+    assert classify("hindsight_reflect", {}) is None
+    assert classify("supermemory_search", {}) is None
+    assert classify("supermemory_profile", {}) is None
+    # Store-style writes.
+    assert classify("hindsight_retain", {"content": "x"}) == "add"
+    assert classify("supermemory_store", {"content": "x"}) == "add"
+    # Delete-style writes.
+    assert classify("supermemory_forget", {"id": "abc"}) == "remove"
+    # fact_store dispatches by ``action`` argument.
+    assert classify("fact_store", {"action": "search"}) is None
+    assert classify("fact_store", {"action": "probe"}) is None
+    assert classify("fact_store", {"action": "list"}) is None
+    assert classify("fact_store", {"action": "add", "content": "x"}) == "add"
+    assert classify("fact_store", {"action": "update"}) == "replace"
+    assert classify("fact_store", {"action": "remove"}) == "remove"
+    # fact_feedback mutates trust scores → block-able.
+    assert classify("fact_feedback", {"action": "helpful"}) == "replace"
+    # Unknown tool → None (don't gate non-memory tools).
+    assert classify("session_search", {}) is None
+
+
+def test_invoke_tool_provider_store_blocked_does_not_call_handle_tool_call(monkeypatch):
+    """Provider store tool: gate blocks → MemoryManager.handle_tool_call MUST NOT fire."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value="should_not_be_called")
+
+    captured = {}
+
+    def _block(write_path, action, target, **kwargs):
+        captured["write_path"] = write_path
+        captured["action"] = action
+        captured["target"] = target
+        captured["content"] = kwargs.get("content")
+        return "BLOCKED store"
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", side_effect=_block):
+        result = agent._invoke_tool(
+            "supermemory_store",
+            {"content": "secret payload"},
+            effective_task_id="task-store-1",
+        )
+
+    import json as _json
+    parsed = _json.loads(result)
+    assert "error" in parsed, f"expected error response, got {parsed}"
+    assert agent._memory_manager.handle_tool_call.call_count == 0, (
+        f"provider store ran despite block ({agent._memory_manager.handle_tool_call.call_count})"
+    )
+    assert captured.get("action") == "add"
+    assert captured.get("write_path") == "provider_tool"
+    assert captured.get("target") == "supermemory_store"
+
+
+def test_invoke_tool_provider_delete_blocked_does_not_call_handle_tool_call(monkeypatch):
+    """Provider delete tool (supermemory_forget): blocked → not invoked."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value="should_not_be_called")
+
+    def _block(action, **kwargs):
+        return "BLOCKED forget" if action == "remove" else None
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", side_effect=_block):
+        result = agent._invoke_tool(
+            "supermemory_forget",
+            {"id": "memory-123"},
+            effective_task_id="task-forget-1",
+        )
+
+    import json as _json
+    parsed = _json.loads(result)
+    assert "error" in parsed
+    assert agent._memory_manager.handle_tool_call.call_count == 0
+
+
+def test_invoke_tool_provider_read_skips_gate(monkeypatch):
+    """Provider read-only tool (supermemory_search): gate is NOT invoked
+    and the call passes through to MemoryManager."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value='{"results": []}')
+
+    gate_mock = MagicMock(return_value="should not be called")
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", gate_mock):
+        agent._invoke_tool(
+            "supermemory_search",
+            {"query": "anything"},
+            effective_task_id="task-read-1",
+        )
+
+    assert gate_mock.call_count == 0, "read-only provider tool should not hit the gate"
+    assert agent._memory_manager.handle_tool_call.call_count == 1
+
+
+def test_invoke_tool_provider_store_allowed_runs_handle_tool_call(monkeypatch):
+    """Counter: provider store with gate-allow → MemoryManager invoked once."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value="stored")
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", return_value=None):
+        agent._invoke_tool(
+            "supermemory_store",
+            {"content": "innocent fact"},
+            effective_task_id="task-store-2",
+        )
+
+    assert agent._memory_manager.handle_tool_call.call_count == 1
+
+
+def test_invoke_tool_provider_write_fail_closes_on_gate_import_error(monkeypatch):
+    """Provider write with helper ImportError must fail closed."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value="should_not_be_called")
+
+    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+    def _import_blocker(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "hermes_cli.plugins" and "get_pre_memory_write_block_message" in (fromlist or ()):
+            raise ImportError("simulated version skew")
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch("builtins.__import__", side_effect=_import_blocker):
+        result = agent._invoke_tool(
+            "hindsight_retain",
+            {"content": "anything"},
+            effective_task_id="task-store-fail-import",
+        )
+
+    import json as _json
+    parsed = _json.loads(result)
+    assert "error" in parsed
+    assert agent._memory_manager.handle_tool_call.call_count == 0
+
+
+# -----------------------------------------------------------------------------
 # Codex finding #2 (HIGH): memory `remove` action bypasses the write gate.
 # Both dispatcher paths (_invoke_tool primary + alt sequential) only ran the
 # gate for action in ("add", "replace").  A plugin that needed to block
