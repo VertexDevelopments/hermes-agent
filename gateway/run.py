@@ -3870,23 +3870,30 @@ class GatewayRunner:
                                     "channel_id": _channel_id_str,
                                     "project": _project_tag,
                                 }
-                                # OQ-31 (D-013 round-7 regression guard):
-                                # mark this session_key as having a fresh
-                                # slash-skill activation set THIS turn.  The
-                                # auto-reset branch in
-                                # _handle_message_with_agent uses this set
-                                # via _clear_session_activation_unless_just_set
-                                # to skip the boundary clear for the row we
-                                # just installed.  Mark unconditionally after
-                                # the cache write — even if the DB persist
-                                # below fails, the cache holds the activation
-                                # and we still want to protect it.
-                                self._slash_activation_this_turn.add(_quick_key)
                                 # OQ-28: write-through to durable activations
                                 # DB so the next turn after a gateway restart
                                 # can resolve active_skill/active_project from
                                 # trusted structured state, not from transcript
                                 # text (which would be spoofable by the user).
+                                #
+                                # OQ-31 (round-7 regression guard): the
+                                # `_slash_activation_this_turn.add(...)`
+                                # MUST run AFTER `record_activation` returns
+                                # successfully — never on cache-only state.
+                                # Codex round-8 finding (HIGH): if we mark
+                                # the guard before/around a DB-persist
+                                # failure, the auto-reset boundary clear
+                                # below skips dropping the *durable* stale
+                                # row from the previous session_id, leaving
+                                # an OQ-30-class leak that resurfaces on
+                                # restart / cache miss.  Trust-safe
+                                # degradation when persist fails: let the
+                                # boundary clear wipe both stale durable
+                                # row AND the fresh cache; the slash skill
+                                # falls back to fail-closed (None project)
+                                # for the current turn — pre_memory_write
+                                # then refuses to apply project policy on a
+                                # row it can't trust, which is correct.
                                 try:
                                     from gateway import skill_state_db as _ssdb
                                     _ssdb.record_activation(
@@ -3896,6 +3903,7 @@ class GatewayRunner:
                                         project=_project_tag,
                                         source="slash",
                                     )
+                                    self._slash_activation_this_turn.add(_quick_key)
                                 except Exception as _slash_db_err:
                                     logger.debug(
                                         "[Gateway] slash-skill DB persist failed "

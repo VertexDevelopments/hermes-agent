@@ -671,6 +671,122 @@ def test_oq31_first_slash_after_auto_reset_preserves_active_project(
     assert cache["project"] == f"fresh-project-{reason}"
 
 
+def test_oq31_db_persist_failure_does_not_suppress_boundary_clear(
+    patched_clear: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """OQ-31 round-8 follow-up (codex round-8 HIGH finding): if the slash
+    dispatcher's `record_activation` call fails (e.g. SQLite hiccup) the
+    guard set MUST NOT be populated, so the auto-reset boundary clear
+    still runs and drops the stale durable row from the *previous*
+    session_id.
+
+    Without this invariant, the in-memory cache holds the fresh
+    activation but the DB still holds the expired session's row keyed
+    on session_key.  On gateway restart / cache miss, the read path
+    (gateway/run.py:10108-10127) repopulates the cache from the stale
+    DB row — reopening the OQ-30 leak under degraded SQLite behavior.
+
+    Trust-safe degradation: when persist fails, the slash skill loses
+    its activation for the current turn (fail-closed; pre_memory_write
+    will refuse to apply project policy on an unverifiable row), but
+    the durable state cannot leak across the session_id boundary.
+    """
+    import gateway.skill_state_db as ssdb_mod
+    from gateway import skill_state_db as ssdb
+
+    src = _make_source()
+    skey = build_session_key(src)
+
+    # Pre-state: stale DB row from the *previous* (now-expired)
+    # session_id.  This is what the boundary clear must drop.
+    _seed_activation(patched_clear, skey)
+    assert ssdb.get_activation(skey) is not None
+
+    runner = _make_runner_with_guard()
+
+    # Simulate the slash dispatcher path where the cache write succeeds
+    # but the DB upsert raises.  The dispatcher code-path:
+    #   1. cache assignment (always)
+    #   2. try: record_activation(...);  add(set)   <- both inside try
+    #      except: log debug; (no add)
+    runner._session_skill_context[skey] = {
+        "active_skill": "maestro-fresh",
+        "channel_id": None,
+        "project": "fresh-project",
+    }
+
+    def _boom(*a, **kw):
+        raise RuntimeError("simulated SQLite I/O hiccup")
+
+    monkeypatch.setattr(ssdb_mod, "record_activation", _boom)
+
+    # Reproduce the dispatcher's protected block.
+    try:
+        ssdb.record_activation(skey, "maestro-fresh", project="fresh-project")
+        runner._slash_activation_this_turn.add(skey)
+    except Exception:
+        # Caller would log debug here; importantly NO add().
+        pass
+
+    # Critical invariant: guard set must remain empty when persist failed.
+    assert skey not in runner._slash_activation_this_turn, (
+        "OQ-31 round-8: cache-only slash activation MUST NOT mark the "
+        "same-turn guard — would suppress durable boundary cleanup"
+    )
+
+    # Now restore the real `record_activation` so the boundary clear
+    # path's clear_activation runs unimpeded.  (clear_activation is a
+    # separate function, not affected by the monkeypatch above.)
+    monkeypatch.undo()
+
+    # Auto-reset boundary fires: with no guard marker, the
+    # unless-just-set helper falls through to the unconditional clear.
+    cleared = runner._clear_session_activation_unless_just_set(skey)
+
+    assert cleared is True, "boundary clear MUST run when persist failed"
+    assert ssdb.get_activation(skey) is None, (
+        "stale DB row from expired session_id MUST be dropped even when "
+        "this-turn DB persist failed — otherwise gateway restart / cache "
+        "miss reads back the expired session's project (OQ-30 leak)"
+    )
+    assert skey not in runner._session_skill_context, (
+        "fresh cache also dropped: trust-safe fail-closed degradation"
+    )
+
+
+def test_oq31_run_py_marks_guard_only_after_record_activation():
+    """OQ-31 round-8 source-level guard: the slash-skill dispatcher MUST
+    populate `_slash_activation_this_turn` ONLY inside the try block,
+    AFTER `record_activation` succeeds.  If the marker were placed
+    before record_activation (or in an except branch), a transient DB
+    failure would leave a cache-only activation that suppresses the
+    auto-reset boundary clear, leaking the previous session_id's
+    durable row across the boundary.
+    """
+    src = (
+        Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+    ).read_text(encoding="utf-8")
+
+    # Find the slash-skill record_activation call.
+    rec_idx = src.find('source="slash",\n                                    )')
+    assert rec_idx != -1, (
+        "slash-skill record_activation block missing or restructured"
+    )
+    # The .add() call should appear AFTER the closing `)` of
+    # record_activation, before the `except` clause.
+    end_call = src.find(")", rec_idx)
+    except_idx = src.find("except", end_call)
+    assert end_call != -1 and except_idx != -1
+    window = src[end_call:except_idx]
+    assert "_slash_activation_this_turn.add(_quick_key)" in window, (
+        "OQ-31 round-8: `_slash_activation_this_turn.add(_quick_key)` must "
+        "appear AFTER `record_activation(...)` returns and BEFORE the "
+        "except clause; placing it elsewhere allows cache-only "
+        "activations to suppress the boundary clear"
+    )
+
+
 def test_oq31_handle_message_finally_clears_per_turn_set():
     """Source-level: handle_message's outer `finally:` MUST discard the
     `_slash_activation_this_turn` entry as defense-in-depth, so a crash

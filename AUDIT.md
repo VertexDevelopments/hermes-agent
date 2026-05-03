@@ -224,3 +224,61 @@ Add to `tests/gateway/test_session_boundary_skill_activation.py`:
 - Tests behaving consistently: not yet run; will validate after impl.
 
 Proceed to Step 3.
+
+## Round-8 follow-up (codex review of fix/d013-oq31-ordering @ initial commit)
+
+Codex round-8 (`adversarial-review` of `984cf7aef..ae284acad`) returned
+**verdict: needs-attention** with one HIGH finding:
+
+> Cache-only slash activation can preserve stale durable project state.
+> The new guard is added immediately after the in-memory cache write,
+> before `_ssdb.record_activation()` succeeds, and DB persist failures
+> are swallowed.  If that upsert fails transiently while an expired
+> session's `slash_skill_activations` row already exists,
+> `_clear_session_activation_unless_just_set()` later skips the
+> boundary clear entirely.  The current turn uses the fresh cache,
+> but the old durable row remains keyed by `session_key`; on gateway
+> restart or any cache miss, the existing DB fallback can reapply the
+> expired session's `active_project` to the fresh transcript.  This
+> reopens the OQ-30 trust-boundary leak under degraded SQLite
+> behavior.
+
+The finding is correct.  The original placement (mark-the-set after
+the cache write, regardless of DB outcome) was wrong: under transient
+SQLite failure, the cache-fresh + DB-stale state suppresses the
+durable cleanup that would have dropped the stale row.
+
+### Resolution
+
+Move the `_slash_activation_this_turn.add(_quick_key)` call **inside**
+the `try:` block, **after** `_ssdb.record_activation(...)` returns
+successfully.  When `record_activation` raises, the marker is NOT
+populated, the auto-reset boundary clear runs unimpeded and drops
+the stale durable row.
+
+Trade-off: when the DB persist fails, the slash skill loses its
+activation for the current turn (fail-closed degradation —
+`pre_memory_write` refuses to apply project policy on a row it can't
+trust, which is the trust-safe default).  This is a rare condition
+and the right default.  Alternative ("track cache-vs-DB persistence
+separately, partial-clear DB-only when persist failed") is more
+complex without proportionate value.
+
+### Tests added (round-8 follow-up)
+
+- `test_oq31_db_persist_failure_does_not_suppress_boundary_clear`:
+  monkeypatch `record_activation` to raise; reproduce the dispatcher's
+  protected block; assert the guard set stays empty, and that the
+  subsequent `_clear_session_activation_unless_just_set(skey)` call
+  drops the stale DB row.
+- `test_oq31_run_py_marks_guard_only_after_record_activation`: source
+  -level guard asserting the `.add(_quick_key)` line appears AFTER the
+  closing `)` of `record_activation` and BEFORE the `except`.
+
+Total OQ-31 tests: 10 behavioral/source-level + 8 prior (round-5 / -6
+/ -7 boundary tests) = 18 in `test_session_boundary_skill_activation.py`.
+
+D-013-relevant suites still 95 passed / 1 skipped after the round-8
+follow-up commit.
+
+Re-fire codex (round-9) post-amend to confirm clean.
