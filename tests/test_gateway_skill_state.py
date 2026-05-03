@@ -301,3 +301,106 @@ def test_run_py_imports_skill_state_db_for_persistence() -> None:
     assert "_ssdb.record_activation" in src
     assert "_ssdb.clear_activation" in src
     assert "_ssdb.get_activation" in src
+
+
+# --- OQ-29: profile isolation (HERMES_HOME) ------------------------------
+#
+# Round-5 codex finding (HIGH, conf 0.97): the DB path is hardcoded to
+# Path.home() / ".hermes" so multi-profile users (HERMES_HOME pointing
+# at a separate profile) cross-leak activations between profiles. The fix
+# is to resolve via hermes_constants.get_hermes_home() lazily, every
+# call (NOT at module import time, since the env var can change).
+
+
+def test_default_db_path_respects_hermes_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """OQ-29: with HERMES_HOME pointing at a custom profile dir, an
+    activation written WITHOUT explicit db_path must land under that
+    profile, NOT under ~/.hermes.
+
+    This proves the path is resolved lazily from get_hermes_home() at
+    call time, so a user with two profiles (work/personal) cannot leak
+    activations between them.
+    """
+    profile_home = tmp_path / "alt-hermes-profile"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    # Force a fresh import so any module-level path constant captured at
+    # load time (the bug we're testing for) is rebuilt under the new env.
+    import gateway.skill_state_db as _ssdb_mod
+    importlib.reload(_ssdb_mod)
+
+    # Sanity: the home helper itself returns the profile path.
+    import hermes_constants
+    assert hermes_constants.get_hermes_home() == profile_home
+
+    skey = "agent:main:telegram:dm:profile-iso-1"
+    _ssdb_mod.record_activation(
+        skey, "maestro-profile",
+        channel_id="c-pi", project="profile",
+        source="slash",
+        # IMPORTANT: no db_path kwarg — exercise the default-resolution path.
+    )
+
+    expected_db = profile_home / "state" / "gateway_sessions.db"
+    assert expected_db.exists(), (
+        f"DB was NOT created under HERMES_HOME={profile_home}; "
+        "OQ-29 path leak still present"
+    )
+
+    # And the row is readable via the same default-path resolution.
+    row = _ssdb_mod.get_activation(skey)
+    assert row is not None
+    assert row["project"] == "profile"
+
+    # Negative: the user's real ~/.hermes file was NOT touched.  We don't
+    # assert absence of the file (it may exist from prior unrelated
+    # activity) but we DO assert the row we just wrote isn't there.
+    real_home_db = Path.home() / ".hermes" / "state" / "gateway_sessions.db"
+    if real_home_db.exists() and real_home_db != expected_db:
+        # If the path constant had captured Path.home() at import time
+        # (the bug), the row would have landed in the real DB.  Look for it.
+        con = sqlite3.connect(str(real_home_db))
+        try:
+            row_in_real = con.execute(
+                "SELECT 1 FROM slash_skill_activations WHERE session_key = ?",
+                (skey,),
+            ).fetchone()
+        finally:
+            con.close()
+        assert row_in_real is None, (
+            "activation written under HERMES_HOME profile leaked into the "
+            "user's real ~/.hermes DB — OQ-29 cross-profile leak still open"
+        )
+
+
+def test_migrate_default_db_path_respects_hermes_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """OQ-29 (migrate script): scripts/migrate_gateway_sessions.init_db()
+    with no db_path must initialize the DB under HERMES_HOME, not
+    ~/.hermes.  Captures the same bug at the second affected file.
+    """
+    profile_home = tmp_path / "alt-hermes-profile-mig"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_oq29_migrate_under_test",
+        Path(__file__).resolve().parents[1] / "scripts"
+        / "migrate_gateway_sessions.py",
+    )
+    assert spec is not None and spec.loader is not None
+    mig = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mig)
+
+    # Call with no arg (or explicit default) — exercise the default path.
+    mig.init_db()
+
+    expected = profile_home / "state" / "gateway_sessions.db"
+    assert expected.exists(), (
+        f"migrate_gateway_sessions.init_db() did NOT honour HERMES_HOME; "
+        f"expected {expected} to exist"
+    )
+

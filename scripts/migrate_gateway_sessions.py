@@ -32,9 +32,24 @@ import argparse
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Optional
+
+from hermes_constants import get_hermes_home
 
 
-DEFAULT_DB_PATH = Path.home() / ".hermes" / "state" / "gateway_sessions.db"
+def _default_db_path() -> Path:
+    """Resolve the gateway_sessions.db path under the active HERMES_HOME.
+
+    Resolved at call time so multi-profile users (HERMES_HOME pointing
+    at a per-profile dir) initialize / inspect the per-profile DB.
+    OQ-29 (codex round-5 HIGH).
+    """
+    return get_hermes_home() / "state" / "gateway_sessions.db"
+
+
+# Backwards-compatible name for callers that import the constant.
+# DO NOT use as a function default — see _default_db_path().
+DEFAULT_DB_PATH = _default_db_path()
 
 
 # Full DDL. Kept as one string so init_db can run it in a single
@@ -74,8 +89,14 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return con
 
 
-def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
-    """Create the DB + schema if missing. Idempotent."""
+def init_db(db_path: Optional[Path] = None) -> None:
+    """Create the DB + schema if missing. Idempotent.
+
+    When `db_path` is omitted, resolves to ``HERMES_HOME/state/
+    gateway_sessions.db`` at call time (OQ-29 multi-profile safety).
+    """
+    if db_path is None:
+        db_path = _default_db_path()
     con = _connect(db_path)
     try:
         with con:
@@ -84,8 +105,14 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
         con.close()
 
 
-def status(db_path: Path = DEFAULT_DB_PATH) -> dict:
-    """Return a small dict useful for sanity checks."""
+def status(db_path: Optional[Path] = None) -> dict:
+    """Return a small dict useful for sanity checks.
+
+    When `db_path` is omitted, resolves to ``HERMES_HOME/state/
+    gateway_sessions.db`` at call time (OQ-29).
+    """
+    if db_path is None:
+        db_path = _default_db_path()
     out: dict = {"db_path": str(db_path), "exists": db_path.exists()}
     if not db_path.exists():
         return out
@@ -110,9 +137,14 @@ def main(argv: list[str] | None = None) -> int:
         description="Initialize / inspect the gateway slash-skill activations DB.",
     )
     p.add_argument("command", choices=("init", "status"))
-    p.add_argument("--db", type=Path, default=DEFAULT_DB_PATH,
-                   help=f"DB path (default: {DEFAULT_DB_PATH})")
+    # Resolve default at parse time (NOT at module import) so HERMES_HOME
+    # changes between import and invocation are honoured. OQ-29.
+    _default_for_help = _default_db_path()
+    p.add_argument("--db", type=Path, default=None,
+                   help=f"DB path (default: {_default_for_help})")
     args = p.parse_args(argv)
+    if args.db is None:
+        args.db = _default_db_path()
 
     if args.command == "init":
         init_db(args.db)

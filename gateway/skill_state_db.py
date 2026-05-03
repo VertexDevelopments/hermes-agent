@@ -34,10 +34,28 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
+from hermes_constants import get_hermes_home
+
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_DB_PATH = Path.home() / ".hermes" / "state" / "gateway_sessions.db"
+def _default_db_path() -> Path:
+    """Resolve the gateway_sessions.db path under the active HERMES_HOME.
+
+    Resolved at call time (not module import) so multi-profile users
+    whose HERMES_HOME points at a per-profile directory (work / personal)
+    write to the per-profile DB, with no cross-leak. (OQ-29: codex
+    round-5 HIGH finding; capturing Path.home() at import time was the
+    bug.)
+    """
+    return get_hermes_home() / "state" / "gateway_sessions.db"
+
+
+# Backwards-compatible name retained for import-side compatibility.
+# IMPORTANT: do NOT use this at signature default time; resolve via
+# _default_db_path() inside each function so HERMES_HOME changes after
+# module load are honoured.
+DEFAULT_DB_PATH = _default_db_path()
 
 # Lazy-loaded migrate module (avoids circular imports; the migrate
 # script is a top-level CLI tool, not a package member).
@@ -86,7 +104,7 @@ def record_activation(
     channel_id: Optional[str] = None,
     project: Optional[str] = None,
     source: str = "slash",
-    db_path: Path = DEFAULT_DB_PATH,
+    db_path: Optional[Path] = None,
 ) -> None:
     """Upsert a slash-skill activation for `session_key`.
 
@@ -96,6 +114,9 @@ def record_activation(
 
     Idempotent: same (session_key, skill) pair re-recorded simply
     refreshes activated_at.
+
+    When `db_path` is omitted, resolves to ``HERMES_HOME/state/
+    gateway_sessions.db`` at call time (multi-profile-safe; OQ-29).
     """
     if source not in ("slash", "auto_skill"):
         raise ValueError(f"invalid source {source!r}; expected slash|auto_skill")
@@ -106,6 +127,8 @@ def record_activation(
             session_key, active_skill,
         )
         return
+    if db_path is None:
+        db_path = _default_db_path()
     _ensure_schema(db_path)
     con = _connect(db_path)
     try:
@@ -132,7 +155,7 @@ def record_activation(
 def get_activation(
     session_key: str,
     *,
-    db_path: Path = DEFAULT_DB_PATH,
+    db_path: Optional[Path] = None,
 ) -> Optional[dict]:
     """Return the persisted activation row for `session_key`, or None.
 
@@ -142,9 +165,14 @@ def get_activation(
          "channel_id":   Optional[str],
          "project":      Optional[str],
          "source":       str}
+
+    When `db_path` is omitted, resolves to ``HERMES_HOME/state/
+    gateway_sessions.db`` at call time (OQ-29).
     """
     if not session_key:
         return None
+    if db_path is None:
+        db_path = _default_db_path()
     _ensure_schema(db_path)
     con = _connect(db_path)
     try:
@@ -171,15 +199,24 @@ def get_activation(
 def clear_activation(
     session_key: str,
     *,
-    db_path: Path = DEFAULT_DB_PATH,
+    db_path: Optional[Path] = None,
 ) -> None:
     """Delete the activation row for `session_key` (no-op if absent).
 
-    Call from /clear /new /reset handlers — session boundary operations
-    must drop the activation so the next turn starts fresh.
+    Call from /clear /new /reset /resume /branch handlers and the
+    compression_exhausted auto-reset path — every logical-session
+    boundary must drop the activation so the next turn starts fresh.
+    (OQ-30: codex round-5 HIGH finding — without these clears, the
+    persisted active_project from session_id A would apply to a
+    different transcript / session_id B sharing the same session_key.)
+
+    When `db_path` is omitted, resolves to ``HERMES_HOME/state/
+    gateway_sessions.db`` at call time (OQ-29).
     """
     if not session_key:
         return
+    if db_path is None:
+        db_path = _default_db_path()
     _ensure_schema(db_path)
     con = _connect(db_path)
     try:
@@ -195,7 +232,7 @@ def clear_activation(
 def clear_all_for_channel(
     channel_id: str,
     *,
-    db_path: Path = DEFAULT_DB_PATH,
+    db_path: Optional[Path] = None,
 ) -> None:
     """Delete every activation row tied to `channel_id` (no-op if none).
 
@@ -203,9 +240,14 @@ def clear_all_for_channel(
     into the gateway today (channel-level resets aren't a current
     surface). Kept here so the wrapper API is the single ownership
     point and runtime code never opens raw connections.
+
+    When `db_path` is omitted, resolves to ``HERMES_HOME/state/
+    gateway_sessions.db`` at call time (OQ-29).
     """
     if not channel_id:
         return
+    if db_path is None:
+        db_path = _default_db_path()
     _ensure_schema(db_path)
     con = _connect(db_path)
     try:
