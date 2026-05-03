@@ -4218,6 +4218,17 @@ class GatewayRunner:
             except Exception as e:
                 logger.debug("Auto-reset notification failed (non-fatal): %s", e)
 
+            # Round-7 H1 (codex round-6 HIGH, conf 0.9): the idle/daily/
+            # suspended auto-reset rotates session_id under the same
+            # session_key inside ``get_or_create_session``, the same way
+            # /resume, /branch, and the compression_exhausted path do.
+            # Without dropping the durable activation row + cache here,
+            # later agent setup repopulates ``_session_skill_context``
+            # from the stale ``slash_skill_activations`` row keyed on
+            # session_key, leaking the expired session's active_project
+            # into the fresh auto-reset transcript.
+            self._clear_session_activation(session_key)
+
             session_entry.was_auto_reset = False
             session_entry.auto_reset_reason = None
 

@@ -302,3 +302,106 @@ def test_run_py_clears_activation_on_compression_exhausted_path():
         "compression_exhausted block does NOT clear the slash-skill "
         "activation — OQ-30 leak across the auto-reset boundary"
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-7 H1: idle / daily / suspended auto-reset path (was_auto_reset)
+# ---------------------------------------------------------------------------
+#
+# Round-6 wired the boundary clear for /resume, /branch, and the
+# compression_exhausted path, but missed the *other* auto-reset boundary:
+# `get_or_create_session` rotating session_id under the same session_key
+# when a session is idle, daily-rolled, or recovered as "suspended" after
+# a crash.  The handler at gateway/run.py:4162-4222 (was_auto_reset block)
+# detects this, posts the user notice, then clears the flags — but never
+# drops the durable activation row.  Result: a stale active_project from
+# the expired session_id is read back and applied to the fresh transcript
+# the moment the next pre_memory_write hook fires.
+#
+# Two-pronged guard, mirroring the round-6 pattern:
+#   1. Behavioral test exercising the helper after seeding cache+DB
+#      activation — proves the helper does the right thing when called
+#      from the auto-reset path (analogous to the compression_exhausted
+#      helper test above).
+#   2. Source-level guard verifying gateway/run.py actually invokes the
+#      helper inside the was_auto_reset block (analogous to the
+#      compression_exhausted source-level guard above).
+
+
+def test_auto_reset_clears_durable_slash_skill_activation(
+    patched_clear: Path,
+):
+    """Round-7 H1: idle/daily/suspended auto-reset MUST clear the
+    slash-skill activation row + cache.  Without this, the next
+    `pre_memory_write` after the auto-reset reads back the stale
+    active_project from the expired session_id (the leak codex round-6
+    flagged at 0.9 confidence)."""
+    from gateway.run import GatewayRunner
+    from gateway import skill_state_db as ssdb
+
+    src = _make_source()
+    skey = build_session_key(src)
+
+    runner = object.__new__(GatewayRunner)
+    runner._session_skill_context = {
+        skey: {"active_skill": "maestro-stale", "channel_id": None,
+               "project": "stale-project"},
+    }
+    _seed_activation(patched_clear, skey)
+    assert ssdb.get_activation(skey) is not None
+
+    # The auto-reset boundary fires inside _handle_message_with_agent's
+    # was_auto_reset branch; that branch's responsibility (post round-7)
+    # is to invoke _clear_session_activation(session_key) before the next
+    # turn's skill context is applied.  Exercise the helper directly to
+    # prove the contract.
+    runner._clear_session_activation(skey)
+
+    assert skey not in runner._session_skill_context, (
+        "in-memory _session_skill_context still holds stale activation "
+        "after auto-reset — round-7 H1 leak via cache"
+    )
+    assert ssdb.get_activation(skey) is None, (
+        "DB row still present after auto-reset — round-7 H1 leak via "
+        "durable state"
+    )
+
+
+def test_run_py_clears_activation_on_was_auto_reset_path():
+    """Round-7 H1 source-level regression guard: the was_auto_reset block
+    in gateway/run.py must invoke _clear_session_activation (or
+    skill_state_db.clear_activation) so the durable activation row is
+    dropped before the fresh session's skill context is applied.
+
+    Codex round-6 finding (HIGH, conf 0.9): the round-5 fix wired
+    boundary clears for /resume, /branch, and compression_exhausted but
+    missed this fourth auto-reset path.  Without the clear here, the
+    persisted active_project from the expired session_id leaks into the
+    auto-reset transcript via _session_skill_context / DB read-back.
+    """
+    src = (
+        Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+    ).read_text(encoding="utf-8")
+
+    # Locate the was_auto_reset branch — the user-facing notice block
+    # that ends with `session_entry.was_auto_reset = False`.
+    idx = src.find("if getattr(session_entry, 'was_auto_reset', False):")
+    assert idx != -1, (
+        "was_auto_reset branch missing entirely — gateway/run.py "
+        "structure changed; update this guard"
+    )
+    end = src.find("session_entry.was_auto_reset = False", idx)
+    assert end != -1, (
+        "was_auto_reset branch terminator missing; structure changed"
+    )
+
+    window = src[idx:end]
+    assert (
+        "_clear_session_activation" in window
+        or "_ssdb.clear_activation" in window
+        or "skill_state_db.clear_activation" in window
+    ), (
+        "was_auto_reset block does NOT clear the slash-skill activation "
+        "— round-7 H1 leak across the idle/daily/suspended auto-reset "
+        "boundary (codex round-6 HIGH conf 0.9)"
+    )
