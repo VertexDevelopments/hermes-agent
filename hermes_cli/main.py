@@ -7303,7 +7303,7 @@ For more help on a command:
     cron_edit = cron_subparsers.add_parser(
         "edit", help="Edit an existing scheduled job"
     )
-    cron_edit.add_argument("job_id", help="Job ID to edit")
+    cron_edit.add_argument("job_id", help="Job ID or name to edit")
     cron_edit.add_argument("--schedule", help="New schedule")
     cron_edit.add_argument("--prompt", help="New prompt/task instruction")
     cron_edit.add_argument("--name", help="New job name")
@@ -7339,21 +7339,21 @@ For more help on a command:
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
-    cron_pause.add_argument("job_id", help="Job ID to pause")
+    cron_pause.add_argument("job_id", help="Job ID or name to pause")
 
     cron_resume = cron_subparsers.add_parser("resume", help="Resume a paused job")
-    cron_resume.add_argument("job_id", help="Job ID to resume")
+    cron_resume.add_argument("job_id", help="Job ID or name to resume")
 
     cron_run = cron_subparsers.add_parser(
         "run", help="Run a job on the next scheduler tick"
     )
-    cron_run.add_argument("job_id", help="Job ID to trigger")
+    cron_run.add_argument("job_id", help="Job ID or name to trigger")
     _add_accept_hooks_flag(cron_run)
 
     cron_remove = cron_subparsers.add_parser(
         "remove", aliases=["rm", "delete"], help="Remove a scheduled job"
     )
-    cron_remove.add_argument("job_id", help="Job ID to remove")
+    cron_remove.add_argument("job_id", help="Job ID or name to remove")
 
     # cron status
     cron_subparsers.add_parser("status", help="Check if cron scheduler is running")

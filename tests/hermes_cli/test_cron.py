@@ -105,3 +105,102 @@ class TestCronCommandLifecycle:
         assert len(jobs) == 1
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
+
+
+class TestCronCommandNameResolution:
+    """OQ-26: cron run/pause/resume/remove/edit accept job names, not just IDs."""
+
+    def test_run_resolves_by_name(self, tmp_cron_dir, capsys):
+        job = create_job(
+            prompt="Daily brief", schedule="every 24h", name="daily-brief"
+        )
+
+        rc = cron_command(Namespace(cron_command="run", job_id="daily-brief"))
+        assert rc == 0
+
+        out = capsys.readouterr().out
+        assert "Triggered job" in out
+        assert job["id"] in out  # canonical ID surfaced in output
+
+    def test_pause_resume_remove_resolve_by_name(self, tmp_cron_dir, capsys):
+        job = create_job(
+            prompt="Heartbeat", schedule="every 1h", name="heartbeat"
+        )
+
+        cron_command(Namespace(cron_command="pause", job_id="heartbeat"))
+        assert get_job(job["id"])["state"] == "paused"
+
+        cron_command(Namespace(cron_command="resume", job_id="heartbeat"))
+        assert get_job(job["id"])["state"] == "scheduled"
+
+        cron_command(Namespace(cron_command="remove", job_id="heartbeat"))
+        assert get_job(job["id"]) is None
+
+    def test_edit_resolves_by_name(self, tmp_cron_dir, capsys):
+        job = create_job(
+            prompt="Edit me", schedule="every 1h", name="edit-target"
+        )
+
+        cron_command(
+            Namespace(
+                cron_command="edit",
+                job_id="edit-target",
+                schedule=None,
+                prompt="New prompt body",
+                name=None,
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                clear_skills=False,
+            )
+        )
+        assert get_job(job["id"])["prompt"] == "New prompt body"
+
+    def test_id_still_works(self, tmp_cron_dir, capsys):
+        """Regression guard: passing a literal ID must still resolve to itself."""
+        job = create_job(prompt="By ID", schedule="every 1h", name="by-id")
+        rc = cron_command(Namespace(cron_command="run", job_id=job["id"]))
+        assert rc == 0
+        assert "Triggered job" in capsys.readouterr().out
+
+    def test_unknown_id_or_name_suggests_close_match(self, tmp_cron_dir, capsys):
+        create_job(prompt="Daily brief", schedule="every 24h", name="daily-brief")
+
+        rc = cron_command(Namespace(cron_command="run", job_id="dailybrief"))
+        assert rc == 1
+
+        err = capsys.readouterr().out
+        assert "No job matches" in err
+        assert "daily-brief" in err  # difflib suggestion
+
+    def test_unknown_with_no_close_match_errors_cleanly(self, tmp_cron_dir, capsys):
+        create_job(prompt="Daily brief", schedule="every 24h", name="daily-brief")
+
+        rc = cron_command(Namespace(cron_command="run", job_id="zzzzzzzzzz"))
+        assert rc == 1
+        assert "No job matches" in capsys.readouterr().out
+
+    def test_duplicate_names_force_id_disambiguation(self, tmp_cron_dir, capsys):
+        # Two jobs with the same name — name lookup MUST refuse to guess.
+        j1 = create_job(prompt="A", schedule="every 1h", name="dupe")
+        j2 = create_job(prompt="B", schedule="every 1h", name="dupe")
+        assert j1["id"] != j2["id"]
+
+        rc = cron_command(Namespace(cron_command="run", job_id="dupe"))
+        assert rc == 1
+
+        msg = capsys.readouterr().out
+        assert "Multiple jobs share the name" in msg
+
+        # Both jobs are still operable by ID.
+        assert cron_command(Namespace(cron_command="run", job_id=j1["id"])) == 0
+
+    def test_disabled_job_resolves_by_name(self, tmp_cron_dir, capsys):
+        """Resume must work for paused/disabled jobs — list_jobs(include_disabled=True)."""
+        job = create_job(prompt="Sleeper", schedule="every 1h", name="sleeper")
+        cron_command(Namespace(cron_command="pause", job_id=job["id"]))
+        # Now paused; resume by name should still resolve.
+        rc = cron_command(Namespace(cron_command="resume", job_id="sleeper"))
+        assert rc == 0
+        assert get_job(job["id"])["state"] == "scheduled"

@@ -38,6 +38,67 @@ def _cron_api(**kwargs):
     return json.loads(cronjob_tool(**kwargs))
 
 
+def _resolve_job_id(identifier: str) -> str:
+    """Resolve a job identifier (ID or name) to an ID.
+
+    The cron tool API only accepts job IDs, but operators almost always
+    know jobs by their human-readable name (`hermes cron create --name
+    daily-brief ...`).  Before OQ-26, the run/pause/resume/remove/edit
+    subcommands forwarded `args.job_id` straight through, so
+    `hermes cron run daily-brief` would error out with "Job not found"
+    even though the name was unambiguous.
+
+    Lookup precedence:
+      1. exact match against ``job["id"]`` (covers prefix-truncated IDs
+         the user already had in their shell history).
+      2. exact match against ``job["name"]`` — case-sensitive, since
+         names are user-controlled and we don't want surprising
+         "name collision" semantics.
+
+    On miss, raises ``ValueError`` with a difflib-suggested closest
+    match across both IDs and names.  Disabled/paused/completed jobs
+    are included so an operator can still resume or remove them.
+    """
+    from cron.jobs import list_jobs
+
+    if not identifier:
+        raise ValueError("Job identifier is required")
+
+    jobs = list_jobs(include_disabled=True)
+
+    for job in jobs:
+        if job.get("id") == identifier:
+            return job["id"]
+
+    name_matches = [j for j in jobs if j.get("name") == identifier]
+    if len(name_matches) == 1:
+        return name_matches[0]["id"]
+    if len(name_matches) > 1:
+        ids = ", ".join(m["id"] for m in name_matches)
+        raise ValueError(
+            f"Multiple jobs share the name '{identifier}' ({ids}). "
+            f"Specify the job ID instead."
+        )
+
+    # Build a suggestion pool from both names and IDs.
+    import difflib
+
+    candidates: List[str] = []
+    for job in jobs:
+        name = job.get("name")
+        if name:
+            candidates.append(name)
+        jid = job.get("id")
+        if jid:
+            candidates.append(jid)
+    suggestion = difflib.get_close_matches(identifier, candidates, n=1, cutoff=0.5)
+    if suggestion:
+        raise ValueError(
+            f"No job matches '{identifier}'. Did you mean: {suggestion[0]}?"
+        )
+    raise ValueError(f"No job matches '{identifier}'.")
+
+
 def cron_list(show_all: bool = False):
     """List all scheduled jobs."""
     from cron.jobs import list_jobs
@@ -187,7 +248,13 @@ def cron_create(args):
 def cron_edit(args):
     from cron.jobs import get_job
 
-    job = get_job(args.job_id)
+    try:
+        resolved_id = _resolve_job_id(args.job_id)
+    except ValueError as e:
+        print(color(str(e), Colors.RED))
+        return 1
+
+    job = get_job(resolved_id)
     if not job:
         print(color(f"Job not found: {args.job_id}", Colors.RED))
         return 1
@@ -210,7 +277,7 @@ def cron_edit(args):
 
     result = _cron_api(
         action="update",
-        job_id=args.job_id,
+        job_id=resolved_id,
         schedule=getattr(args, "schedule", None),
         prompt=getattr(args, "prompt", None),
         name=getattr(args, "name", None),
@@ -237,12 +304,24 @@ def cron_edit(args):
 
 
 def _job_action(action: str, job_id: str, success_verb: str) -> int:
-    result = _cron_api(action=action, job_id=job_id)
+    # OQ-26: accept either a job ID or a job name (e.g. `hermes cron run
+    # daily-brief`).  Previously the API only accepted IDs, so name input
+    # produced a confusing "Job not found" error.  Resolution happens in
+    # the CLI rather than the tool API to avoid changing the tool
+    # contract — agents calling cronjob_tool() programmatically still
+    # need to pass IDs.
+    try:
+        resolved_id = _resolve_job_id(job_id)
+    except ValueError as e:
+        print(color(str(e), Colors.RED))
+        return 1
+
+    result = _cron_api(action=action, job_id=resolved_id)
     if not result.get("success"):
         print(color(f"Failed to {action} job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
     job = result.get("job") or result.get("removed_job") or {}
-    print(color(f"{success_verb} job: {job.get('name', job_id)} ({job_id})", Colors.GREEN))
+    print(color(f"{success_verb} job: {job.get('name', resolved_id)} ({resolved_id})", Colors.GREEN))
     if action in {"resume", "run"} and result.get("job", {}).get("next_run_at"):
         print(f"  Next run: {result['job']['next_run_at']}")
     if action == "run":
