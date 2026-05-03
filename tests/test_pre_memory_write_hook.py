@@ -602,6 +602,125 @@ def test_helper_blocks_when_hook_callback_raises():
 
 
 # -----------------------------------------------------------------------------
+# Codex finding #1 (HIGH): pre_memory_write skill_context never populated.
+#
+# ``_current_skill_context`` reads ``_active_skill_name`` / ``_active_channel_id``
+# / ``_active_project`` but the gateway never assigned them.  Hooks always saw
+# ``{"active_skill": None, "channel_id": None, "project": None}`` so a project-
+# confidentiality memory guard couldn't distinguish projects — it either
+# blocked everything or leaked between projects.  Fix: an explicit setter on
+# AIAgent that the gateway turn loop calls per message.
+# -----------------------------------------------------------------------------
+
+
+def test_apply_skill_context_populates_attributes(monkeypatch):
+    """The setter assigns the underlying attributes that
+    ``_current_skill_context`` reads."""
+    agent, _ = _build_test_agent(monkeypatch)
+    agent.apply_skill_context(
+        active_skill="maestro-zenflow",
+        channel_id="-100123456789",
+        project="zenflow",
+    )
+    ctx = agent._current_skill_context()
+    assert ctx == {
+        "active_skill": "maestro-zenflow",
+        "channel_id": "-100123456789",
+        "project": "zenflow",
+    }
+
+
+def test_apply_skill_context_clears_with_none(monkeypatch):
+    """Passing None for a field clears it; downstream plugins see None."""
+    agent, _ = _build_test_agent(monkeypatch)
+    agent.apply_skill_context(active_skill="x", channel_id="y", project="z")
+    agent.apply_skill_context()  # default-None clears all fields
+    ctx = agent._current_skill_context()
+    assert ctx == {"active_skill": None, "channel_id": None, "project": None}
+
+
+def test_pre_memory_write_hook_receives_populated_skill_context(monkeypatch):
+    """Integration: with apply_skill_context populated, the gate handler sees
+    non-null active_skill / channel_id / project on a memory write."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent.apply_skill_context(
+        active_skill="maestro-zenflow",
+        channel_id="-100123456789",
+        project="zenflow",
+    )
+    agent._memory_manager = MagicMock()
+    captured = {}
+
+    def _capture_then_allow(skill_context, **kwargs):
+        captured["skill_context"] = dict(skill_context) if skill_context else {}
+        return None
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", side_effect=_capture_then_allow):
+        with patch("tools.memory_tool.memory_tool", MagicMock(return_value="saved")):
+            agent._invoke_tool(
+                "memory",
+                {"action": "add", "target": "memory", "content": "fact"},
+                effective_task_id="task-skill-ctx",
+            )
+
+    assert captured.get("skill_context") == {
+        "active_skill": "maestro-zenflow",
+        "channel_id": "-100123456789",
+        "project": "zenflow",
+    }
+
+
+def test_gateway_wires_apply_skill_context_per_turn():
+    """Source-level guard: gateway/run.py persists per-session skill context
+    AND applies it to the cached/created agent every turn.  Without both
+    legs the gate hooks would still see None.  Backed by per-attribute
+    behavioural tests above; this ensures the wiring is not silently deleted
+    in a future refactor."""
+    src = open("/Users/zenflow/.hermes/hermes-agent/gateway/run.py", "r", encoding="utf-8").read()
+    # Storage initialised in __init__.
+    assert "self._session_skill_context" in src, (
+        "gateway must own _session_skill_context dict (codex round-10 finding #1)"
+    )
+    # Populated in the auto_skill branch (via defensive _skill_ctx_dict alias
+    # so test fixtures that bypass __init__ still work).
+    assert "_skill_ctx_dict[session_key]" in src
+    # Applied to agent each turn (per-message setter call).
+    assert "agent.apply_skill_context" in src
+    # Cleared on session reset so a new session starts clean.
+    assert "_skill_ctx_dict.pop(session_key" in src
+
+
+def test_pre_memory_write_hook_skill_context_propagates_to_provider_tools(monkeypatch):
+    """Provider tool path must also surface populated skill_context — the
+    gate at finding #3 uses the same _current_skill_context()."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent.apply_skill_context(active_skill="maestro-zenflow", project="zenflow")
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value="stored")
+
+    captured = {}
+
+    def _capture_then_allow(skill_context, **kwargs):
+        captured["skill_context"] = dict(skill_context) if skill_context else {}
+        return None
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", side_effect=_capture_then_allow):
+        agent._invoke_tool(
+            "supermemory_store",
+            {"content": "project secret"},
+            effective_task_id="task-provider-skill",
+        )
+
+    assert captured["skill_context"]["active_skill"] == "maestro-zenflow"
+    assert captured["skill_context"]["project"] == "zenflow"
+
+
+# -----------------------------------------------------------------------------
 # Codex finding #3 (HIGH): provider memory write tools bypass pre_memory_write.
 #
 # ``self._memory_manager.handle_tool_call(...)`` is invoked unguarded for
