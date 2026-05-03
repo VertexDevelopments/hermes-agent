@@ -719,33 +719,53 @@ def test_oq31_db_persist_failure_does_not_suppress_boundary_clear(
     def _boom(*a, **kw):
         raise RuntimeError("simulated SQLite I/O hiccup")
 
-    monkeypatch.setattr(ssdb_mod, "record_activation", _boom)
+    # OQ-34 (codex round-9 MED finding): scope the `_boom` override to
+    # ONLY the protected block.  The earlier `monkeypatch.undo()` call
+    # restored ALL of `patched_clear`'s wrappers too, redirecting the
+    # subsequent boundary clear + verification read to the default
+    # HERMES_HOME DB instead of the seeded `tmp_db` — making the test
+    # vacuous (it could pass even if the boundary clear silently failed
+    # against the wrong DB).  Using `monkeypatch.context()` confines
+    # the `record_activation = _boom` override to the `with` block; on
+    # exit, only that one override is undone, leaving `patched_clear`'s
+    # `_record` / `_get` / `_clear` wrappers in effect for the
+    # boundary clear + read below.  Final assertion now also passes
+    # `db_path=patched_clear` explicitly so the test is robust even if
+    # someone refactors the fixture wrappers.
+    with monkeypatch.context() as mp:
+        mp.setattr(ssdb_mod, "record_activation", _boom)
 
-    # Reproduce the dispatcher's protected block.
-    try:
-        ssdb.record_activation(skey, "maestro-fresh", project="fresh-project")
-        runner._slash_activation_this_turn.add(skey)
-    except Exception:
-        # Caller would log debug here; importantly NO add().
-        pass
+        # Reproduce the dispatcher's protected block.
+        try:
+            ssdb.record_activation(skey, "maestro-fresh", project="fresh-project")
+            runner._slash_activation_this_turn.add(skey)
+        except Exception:
+            # Caller would log debug here; importantly NO add().
+            pass
 
-    # Critical invariant: guard set must remain empty when persist failed.
-    assert skey not in runner._slash_activation_this_turn, (
-        "OQ-31 round-8: cache-only slash activation MUST NOT mark the "
-        "same-turn guard — would suppress durable boundary cleanup"
-    )
+        # Critical invariant: guard set must remain empty when persist
+        # failed.  Verified inside the context so the override is
+        # definitely active during the protected block.
+        assert skey not in runner._slash_activation_this_turn, (
+            "OQ-31 round-8: cache-only slash activation MUST NOT mark the "
+            "same-turn guard — would suppress durable boundary cleanup"
+        )
 
-    # Now restore the real `record_activation` so the boundary clear
-    # path's clear_activation runs unimpeded.  (clear_activation is a
-    # separate function, not affected by the monkeypatch above.)
-    monkeypatch.undo()
+    # Context exited: the `_boom` override on `record_activation` is
+    # undone, but `patched_clear`'s wrappers (`_record` / `_get` /
+    # `_clear` routing to `tmp_db`) remain in effect.
 
     # Auto-reset boundary fires: with no guard marker, the
-    # unless-just-set helper falls through to the unconditional clear.
+    # unless-just-set helper falls through to the unconditional clear,
+    # which goes through `patched_clear`'s `_clear` wrapper (→ tmp_db).
     cleared = runner._clear_session_activation_unless_just_set(skey)
 
     assert cleared is True, "boundary clear MUST run when persist failed"
-    assert ssdb.get_activation(skey) is None, (
+    # Explicit db_path read against the originally-seeded DB.  Belt-
+    # and-suspenders verification per codex round-9 recommendation:
+    # confirms the seeded row in `patched_clear` (== `tmp_db`) was
+    # actually dropped, not just that *some* DB has no row.
+    assert ssdb.get_activation(skey, db_path=patched_clear) is None, (
         "stale DB row from expired session_id MUST be dropped even when "
         "this-turn DB persist failed — otherwise gateway restart / cache "
         "miss reads back the expired session's project (OQ-30 leak)"
