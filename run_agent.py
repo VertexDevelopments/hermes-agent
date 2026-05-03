@@ -678,30 +678,93 @@ def _qwen_portal_headers() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Memory provider tool classifier (codex round-10 finding #3).
+# Memory provider tool classifier (codex round-10 finding #3, hardened by
+# round-2 finding H1).
 #
 # External MemoryProvider tools (hindsight_*, supermemory_*, fact_store,
 # fact_feedback, etc.) are dispatched through MemoryManager.handle_tool_call
 # WITHOUT routing through the built-in memory tool gate.  pre_tool_call can
 # only block by tool name — it cannot inspect content/action semantics.
 # This classifier maps a provider tool + args to a normalized memory action
-# ("add" | "replace" | "remove") that the pre_memory_write hook understands,
-# or returns None if the tool is read-only and should not be gated.
+# ("add" | "replace" | "remove") that the pre_memory_write hook understands.
 #
-# Naming heuristic: any tool with a write-style suffix is a mutation.  Tools
-# that take an ``action`` enum argument (fact_store, fact_feedback) are
-# dispatched by that action.  Read-only patterns (search/recall/reflect/
-# probe/related/reason/contradict/list/profile) explicitly return None.
+# Round-1 used suffix heuristics (_store/_retain/_remember/_forget/_delete).
+# Codex round-2 found this missed real shipped writes that don't fit the
+# pattern (mem0_conclude, honcho_conclude, brv_curate, viking_add_resource,
+# retaindb_upload_file/_ingest_file/_delete_file).  Naming is not a security
+# boundary — replaced with an explicit per-tool registry.  Action-dispatched
+# tools (fact_store, fact_feedback, honcho_profile, honcho_conclude) keep
+# their special-case branches because their action depends on argument
+# shape, not the tool name alone.
+#
+# Unknown provider tools (registered with MemoryManager but not in the
+# registry) return the literal sentinel ``"unknown"``.  The gate function
+# then invokes pre_memory_write with action=``provider_unknown_write`` and
+# blocks on any returned message OR if the gate is silent — fail-closed
+# default ensures shipping a new provider without registry update cannot
+# silently bypass the write gate.
 # ---------------------------------------------------------------------------
 
-_PROVIDER_TOOL_WRITE_SUFFIXES = (
-    "_store", "_retain", "_remember", "_save", "_capture", "_write",
-)
-_PROVIDER_TOOL_DELETE_SUFFIXES = ("_forget", "_delete", "_remove")
-_PROVIDER_TOOL_READ_PATTERNS = (
-    "_search", "_recall", "_reflect", "_profile", "_query",
-    "_lookup", "_get", "_fetch",
-)
+# Explicit per-provider mutation registry.  Values:
+#   "read"    — read-only, classifier returns None (no gate).
+#   "add"     — creates new memory; gate with action="add".
+#   "replace" — modifies existing memory; gate with action="replace".
+#   "remove"  — deletes memory; gate with action="remove".
+#
+# When adding a new provider tool, add it here.  Forgetting to add it does
+# not silently fail open — unknown tools are gated under
+# action="provider_unknown_write" and blocked by default.
+PROVIDER_MEMORY_TOOL_ACTIONS: Dict[str, str] = {
+    # hindsight (Hindsight Cloud / local)
+    "hindsight_retain": "add",
+    "hindsight_recall": "read",
+    "hindsight_reflect": "read",
+    # supermemory (Supermemory.ai)
+    "supermemory_store": "add",
+    "supermemory_search": "read",
+    "supermemory_forget": "remove",
+    "supermemory_profile": "read",
+    # mem0 (Mem0 Platform)
+    "mem0_profile": "read",
+    "mem0_search": "read",
+    "mem0_conclude": "add",  # MISSED by round-1 suffix logic
+    # brv (ByteRover)
+    "brv_query": "read",
+    "brv_curate": "add",  # MISSED by round-1 suffix logic
+    "brv_status": "read",
+    # viking (OpenViking)
+    "viking_search": "read",
+    "viking_read": "read",
+    "viking_browse": "read",  # navigation only (list/tree/stat)
+    "viking_remember": "add",
+    "viking_add_resource": "add",  # MISSED by round-1 suffix logic
+    # retaindb (RetainDB shared store + file storage)
+    "retaindb_profile": "read",
+    "retaindb_search": "read",
+    "retaindb_context": "read",
+    "retaindb_remember": "add",
+    "retaindb_forget": "remove",
+    "retaindb_upload_file": "add",   # MISSED by round-1 suffix logic
+    "retaindb_list_files": "read",
+    "retaindb_read_file": "read",
+    "retaindb_ingest_file": "add",   # MISSED by round-1 suffix logic
+    "retaindb_delete_file": "remove",  # MISSED by round-1 suffix logic
+}
+
+# Tools whose action depends on argument shape, not the name.  Each has a
+# dedicated branch in ``_classify_provider_memory_tool_action`` below.
+_PROVIDER_ACTION_DISPATCHED: frozenset[str] = frozenset({
+    "fact_store",
+    "fact_feedback",
+    "honcho_profile",
+    "honcho_conclude",
+})
+
+# Sentinel returned for provider tools that are registered with
+# MemoryManager but absent from the registry above.  Caller (``_gate_
+# provider_memory_tool``) treats this as fail-closed.
+_PROVIDER_UNKNOWN = "unknown"
+
 # fact_store ``action`` enum → normalised memory action.
 _FACT_STORE_ACTION_MAP = {
     "add": "add",
@@ -718,18 +781,27 @@ def _classify_provider_memory_tool_action(
     tool_name: str,
     function_args: Optional[Dict[str, Any]],
 ) -> Optional[str]:
-    """Return ``"add" | "replace" | "remove"`` if ``tool_name`` mutates
-    provider memory, else ``None``.
+    """Return one of:
 
-    None means "no gate" — either the tool is read-only or it is not a
-    memory provider tool at all.  Caller should still check
-    ``MemoryManager.has_tool(tool_name)`` to confirm provider ownership.
+    * ``"add" | "replace" | "remove"`` — known mutating provider tool;
+      caller must run pre_memory_write with this action.
+    * ``"unknown"`` — provider tool not in PROVIDER_MEMORY_TOOL_ACTIONS
+      and not action-dispatched; caller MUST fail closed (gate with
+      action="provider_unknown_write" and block on any message OR silent
+      response).
+    * ``None`` — either a known read-only provider tool or not a memory
+      provider tool at all (caller already gated by has_tool, so for
+      provider tools this means read-only).
+
+    Round-2 hardening: no suffix-based inference.  Every shipped provider
+    tool is in the registry; new tools default to fail-closed via the
+    ``"unknown"`` sentinel until explicitly classified.
     """
     if not isinstance(tool_name, str) or not tool_name:
         return None
     args = function_args if isinstance(function_args, dict) else {}
 
-    # action-dispatched tools first (fact_store / fact_feedback).
+    # Action-dispatched tools: action depends on argument shape.
     if tool_name == "fact_store":
         action = str(args.get("action") or "").lower()
         if action in _FACT_STORE_READ_ACTIONS:
@@ -739,20 +811,30 @@ def _classify_provider_memory_tool_action(
         # Both helpful/unhelpful adjust trust scores → mutation.
         # Use "replace" — closest to "modifying existing fact metadata".
         return "replace"
-
-    lower = tool_name.lower()
-    # Explicit read-only patterns short-circuit before write-suffix check
-    # (a hypothetical "memory_search_store" stays read because search wins).
-    for pat in _PROVIDER_TOOL_READ_PATTERNS:
-        if lower.endswith(pat):
-            return None
-    for suf in _PROVIDER_TOOL_DELETE_SUFFIXES:
-        if lower.endswith(suf):
-            return "remove"
-    for suf in _PROVIDER_TOOL_WRITE_SUFFIXES:
-        if lower.endswith(suf):
+    if tool_name == "honcho_profile":
+        # `card` arg present → updating peer card (replace semantics).
+        # Card omitted → reading the card.  Empty list still counts as a
+        # write (overwrites with empty set).
+        if "card" in args:
+            return "replace"
+        return None
+    if tool_name == "honcho_conclude":
+        # `conclusion` → create a fact (add).  `delete_id` → remove a fact.
+        # Neither → caller error path; provider rejects, no gate needed.
+        if args.get("conclusion") is not None:
             return "add"
-    return None
+        if args.get("delete_id") is not None:
+            return "remove"
+        return None
+
+    # Look up in the explicit registry.
+    mapped = PROVIDER_MEMORY_TOOL_ACTIONS.get(tool_name)
+    if mapped is None:
+        # Unknown provider tool — fail-closed sentinel for the gate caller.
+        return _PROVIDER_UNKNOWN
+    if mapped == "read":
+        return None
+    return mapped
 
 
 def _gate_provider_memory_tool(
@@ -765,10 +847,19 @@ def _gate_provider_memory_tool(
     Returns a block reason string when the gate refuses, ``None`` when the
     write is permitted or the tool is read-only.  Fail-closed on helper
     ImportError (returns a descriptive block message).
+
+    Round-2 hardening (H1): unknown provider tools (those not in the
+    explicit registry) are gated under action="provider_unknown_write" and
+    blocked by default — even if no plugin returns a message.  Shipping a
+    new provider without registry update therefore cannot silently bypass
+    the write gate.
     """
     action = _classify_provider_memory_tool_action(tool_name, function_args)
     if action is None:
-        return None  # read-only or unrecognised → no gate
+        return None  # known read-only tool → no gate
+
+    is_unknown = action == _PROVIDER_UNKNOWN
+    gate_action = "provider_unknown_write" if is_unknown else action
 
     try:
         from hermes_cli.plugins import (
@@ -793,14 +884,20 @@ def _gate_provider_memory_tool(
         function_args.get("content")
         or function_args.get("text")
         or function_args.get("payload")
+        or function_args.get("conclusion")
+        or function_args.get("url")
+        or function_args.get("local_path")
     )
     old_text = (
         function_args.get("old_text")
         or function_args.get("id")
         or function_args.get("query")
+        or function_args.get("delete_id")
+        or function_args.get("memory_id")
+        or function_args.get("file_id")
     )
-    return _gate(
-        action=action,
+    block = _gate(
+        action=gate_action,
         target=tool_name,
         content=content if isinstance(content, str) else None,
         old_text=old_text if isinstance(old_text, str) else None,
@@ -808,6 +905,25 @@ def _gate_provider_memory_tool(
         session_id=getattr(self_agent, "session_id", None),
         skill_context=self_agent._current_skill_context(),
     )
+    if block:
+        return block
+    if is_unknown:
+        # Fail-closed default: an unrecognised provider tool that no plugin
+        # explicitly allowed must not run.  Operators add a rule to the
+        # registry (PROVIDER_MEMORY_TOOL_ACTIONS) once the tool's mutation
+        # semantics are known.
+        logger.error(
+            "provider memory tool %s: not in PROVIDER_MEMORY_TOOL_ACTIONS "
+            "registry and no plugin allowed it; REFUSING memory write "
+            "fail-closed (add the tool to the registry to enable it)",
+            tool_name,
+        )
+        return (
+            f"Memory write blocked: provider tool '{tool_name}' is not "
+            f"classified in PROVIDER_MEMORY_TOOL_ACTIONS — refusing "
+            f"fail-closed.  Add a registry entry to enable it."
+        )
+    return None
 
 
 class AIAgent:

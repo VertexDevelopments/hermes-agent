@@ -757,8 +757,13 @@ def test_provider_tool_classifier_identifies_writes():
     assert classify("fact_store", {"action": "remove"}) == "remove"
     # fact_feedback mutates trust scores → block-able.
     assert classify("fact_feedback", {"action": "helpful"}) == "replace"
-    # Unknown tool → None (don't gate non-memory tools).
-    assert classify("session_search", {}) is None
+    # Round-2 H1: unrecognised provider tool returns "unknown" (fail-closed
+    # sentinel for the gate caller).  In round-1 this was None, but suffix-
+    # based classification was unsafe — see test_unknown_provider_tool_*
+    # below.  Caller (_gate_provider_memory_tool) only invokes the
+    # classifier after MemoryManager.has_tool() so non-provider tools never
+    # hit this branch in production.
+    assert classify("session_search", {}) == "unknown"
 
 
 def test_invoke_tool_provider_store_blocked_does_not_call_handle_tool_call(monkeypatch):
@@ -1003,3 +1008,413 @@ def test_helper_blocks_when_one_callback_raises_alongside_others():
     assert "ValueError" in result or "kaboom" in result, (
         f"block message should reference the failure; got: {result!r}"
     )
+
+
+# -----------------------------------------------------------------------------
+# Codex round-2 finding H1: provider mutation registry must be explicit, with
+# unknown provider tools fail-closed.  Suffix-based classifier in round-1
+# missed mem0_conclude / honcho_conclude / brv_curate / viking_add_resource /
+# retaindb_upload_file etc. — naming is not a security boundary.
+# -----------------------------------------------------------------------------
+
+
+def test_provider_mutation_registry_covers_every_shipped_provider_tool():
+    """Source-level guard: every shipped provider tool must be classified
+    in PROVIDER_MEMORY_TOOL_ACTIONS or its action-dispatched special case."""
+    from run_agent import (
+        PROVIDER_MEMORY_TOOL_ACTIONS,
+        _PROVIDER_ACTION_DISPATCHED,
+    )
+    expected_writes = {
+        # hindsight
+        "hindsight_retain": "add",
+        "hindsight_recall": "read",
+        "hindsight_reflect": "read",
+        # supermemory
+        "supermemory_store": "add",
+        "supermemory_search": "read",
+        "supermemory_forget": "remove",
+        "supermemory_profile": "read",
+        # mem0
+        "mem0_profile": "read",
+        "mem0_search": "read",
+        "mem0_conclude": "add",
+        # brv (ByteRover)
+        "brv_query": "read",
+        "brv_curate": "add",
+        "brv_status": "read",
+        # viking (OpenViking)
+        "viking_search": "read",
+        "viking_read": "read",
+        "viking_browse": "read",
+        "viking_remember": "add",
+        "viking_add_resource": "add",
+        # retaindb
+        "retaindb_profile": "read",
+        "retaindb_search": "read",
+        "retaindb_context": "read",
+        "retaindb_remember": "add",
+        "retaindb_forget": "remove",
+        "retaindb_upload_file": "add",
+        "retaindb_list_files": "read",
+        "retaindb_read_file": "read",
+        "retaindb_ingest_file": "add",
+        "retaindb_delete_file": "remove",
+    }
+    for tool, action in expected_writes.items():
+        assert tool in PROVIDER_MEMORY_TOOL_ACTIONS, (
+            f"shipped provider tool {tool!r} missing from registry"
+        )
+        assert PROVIDER_MEMORY_TOOL_ACTIONS[tool] == action, (
+            f"{tool} classified as {PROVIDER_MEMORY_TOOL_ACTIONS[tool]!r}, "
+            f"expected {action!r}"
+        )
+    # Action-dispatched tools (handled by special-case branches, not the flat map)
+    for tool in ("fact_store", "fact_feedback", "honcho_profile", "honcho_conclude"):
+        assert tool in _PROVIDER_ACTION_DISPATCHED, (
+            f"action-dispatched provider tool {tool!r} missing from special-case set"
+        )
+
+
+def test_classify_returns_known_actions_for_each_registry_entry():
+    """Every value in PROVIDER_MEMORY_TOOL_ACTIONS classifies to a recognised
+    memory action (read/add/replace/remove)."""
+    from run_agent import (
+        PROVIDER_MEMORY_TOOL_ACTIONS,
+        _classify_provider_memory_tool_action,
+    )
+    valid = {"read", "add", "replace", "remove"}
+    for tool, expected in PROVIDER_MEMORY_TOOL_ACTIONS.items():
+        assert expected in valid, f"{tool} → {expected!r} not in {valid}"
+        result = _classify_provider_memory_tool_action(tool, {})
+        # read tools return None (no gate); writes/deletes/replaces return
+        # the matching action string.
+        if expected == "read":
+            assert result is None, f"{tool} should be read-only (returned {result!r})"
+        else:
+            assert result == expected, f"{tool} → {result!r}, expected {expected!r}"
+
+
+def test_unknown_provider_tool_returns_unknown_sentinel():
+    """A provider tool not in the registry and not action-dispatched returns
+    the literal 'unknown' sentinel — caller fails closed."""
+    from run_agent import _classify_provider_memory_tool_action
+    # Use a name that cannot collide with any built-in or future provider tool
+    # but looks like a memory provider mutator (the round-1 classifier would
+    # have either missed this OR mis-classified by suffix).
+    assert _classify_provider_memory_tool_action(
+        "newprovider_persist", {}
+    ) == "unknown"
+    assert _classify_provider_memory_tool_action(
+        "future_memory_overwrite", {"content": "x"}
+    ) == "unknown"
+
+
+def test_classify_returns_unknown_for_non_registered_provider_tools():
+    """Non-registered provider tools return the "unknown" sentinel so the
+    gate caller fails closed.  In production the classifier is only called
+    after MemoryManager.has_tool() — so any tool name reaching this point
+    is a real provider tool that simply hasn't been classified yet.  Empty
+    string and None remain None (defensive)."""
+    from run_agent import _classify_provider_memory_tool_action
+    assert _classify_provider_memory_tool_action("future_provider_persist", {}) == "unknown"
+    assert _classify_provider_memory_tool_action("session_search", {}) == "unknown"
+    # Empty or non-string names: defensive None (caller has nothing to gate).
+    assert _classify_provider_memory_tool_action("", {}) is None
+    assert _classify_provider_memory_tool_action(None, {}) is None  # type: ignore[arg-type]
+
+
+def test_honcho_profile_classified_by_card_argument():
+    """honcho_profile is action-dispatched: passing `card` updates the peer
+    card (replace); omitting `card` reads it (None)."""
+    from run_agent import _classify_provider_memory_tool_action
+    assert _classify_provider_memory_tool_action(
+        "honcho_profile", {"peer": "user"}
+    ) is None
+    assert _classify_provider_memory_tool_action(
+        "honcho_profile", {"peer": "user", "card": ["fact 1", "fact 2"]}
+    ) == "replace"
+    # Empty list is still a write (overwrites with empty set)
+    assert _classify_provider_memory_tool_action(
+        "honcho_profile", {"card": []}
+    ) == "replace"
+
+
+def test_honcho_conclude_classified_by_payload_field():
+    """honcho_conclude: `conclusion` => add; `delete_id` => remove; neither => None."""
+    from run_agent import _classify_provider_memory_tool_action
+    assert _classify_provider_memory_tool_action(
+        "honcho_conclude", {"conclusion": "user prefers terse replies"}
+    ) == "add"
+    assert _classify_provider_memory_tool_action(
+        "honcho_conclude", {"delete_id": "abc-123"}
+    ) == "remove"
+    # Caller error path (neither field) — provider rejects, but we don't
+    # need to gate; classifier returns None and the call passes through to
+    # provider which returns its own error.
+    assert _classify_provider_memory_tool_action(
+        "honcho_conclude", {}
+    ) is None
+
+
+def test_invoke_tool_unknown_provider_tool_fails_closed(monkeypatch):
+    """An unrecognised provider tool MUST be gated with action=
+    'provider_unknown_write' and blocked when the gate refuses."""
+    from unittest.mock import patch, MagicMock
+    import json as _json
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value="should_not_be_called")
+
+    captured = {}
+
+    def _block(action, target, **kwargs):
+        captured["action"] = action
+        captured["target"] = target
+        captured["content"] = kwargs.get("content")
+        return "BLOCKED unknown provider tool"
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", side_effect=_block):
+        result = agent._invoke_tool(
+            "newprovider_persist",
+            {"content": "exfiltrate this"},
+            effective_task_id="task-unknown-1",
+        )
+
+    parsed = _json.loads(result)
+    assert "error" in parsed
+    assert agent._memory_manager.handle_tool_call.call_count == 0, (
+        "fail-open: unknown provider tool ran despite block"
+    )
+    assert captured.get("action") == "provider_unknown_write"
+    assert captured.get("target") == "newprovider_persist"
+    assert captured.get("content") == "exfiltrate this"
+
+
+def test_invoke_tool_unknown_provider_tool_blocked_when_gate_silent(monkeypatch):
+    """Even when no plugin is registered (gate returns None), an unknown
+    provider tool MUST still be blocked — fail-closed default."""
+    from unittest.mock import patch, MagicMock
+    import json as _json
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value="should_not_be_called")
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", return_value=None):
+        result = agent._invoke_tool(
+            "newprovider_persist",
+            {"content": "anything"},
+            effective_task_id="task-unknown-2",
+        )
+
+    parsed = _json.loads(result)
+    assert "error" in parsed, (
+        f"unknown provider tool ran with no gate; got {parsed!r} — must fail closed"
+    )
+    assert agent._memory_manager.handle_tool_call.call_count == 0
+
+
+def test_invoke_tool_mem0_conclude_blocked(monkeypatch):
+    """mem0_conclude is a real shipped write that round-1 suffix logic missed
+    (no _store/_retain/_remember suffix).  Gate must intercept it."""
+    from unittest.mock import patch, MagicMock
+    import json as _json
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value="should_not_be_called")
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", return_value="BLOCKED mem0"):
+        result = agent._invoke_tool(
+            "mem0_conclude",
+            {"conclusion": "private fact"},
+            effective_task_id="task-mem0-1",
+        )
+
+    parsed = _json.loads(result)
+    assert "error" in parsed
+    assert agent._memory_manager.handle_tool_call.call_count == 0
+
+
+def test_invoke_tool_honcho_conclude_create_blocked(monkeypatch):
+    """honcho_conclude with `conclusion` is a write — must be gated."""
+    from unittest.mock import patch, MagicMock
+    import json as _json
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value="should_not_be_called")
+
+    captured = {}
+
+    def _block(action, **kwargs):
+        captured["action"] = action
+        return "BLOCKED honcho" if action == "add" else None
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", side_effect=_block):
+        result = agent._invoke_tool(
+            "honcho_conclude",
+            {"conclusion": "private user preference"},
+            effective_task_id="task-honcho-1",
+        )
+
+    parsed = _json.loads(result)
+    assert "error" in parsed
+    assert agent._memory_manager.handle_tool_call.call_count == 0
+    assert captured.get("action") == "add"
+
+
+def test_invoke_tool_honcho_conclude_delete_blocked(monkeypatch):
+    """honcho_conclude with `delete_id` is a remove — must be gated."""
+    from unittest.mock import patch, MagicMock
+    import json as _json
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value="should_not_be_called")
+
+    captured = {}
+
+    def _block(action, **kwargs):
+        captured["action"] = action
+        return "BLOCKED honcho rm" if action == "remove" else None
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", side_effect=_block):
+        result = agent._invoke_tool(
+            "honcho_conclude",
+            {"delete_id": "fact-abc"},
+            effective_task_id="task-honcho-2",
+        )
+
+    parsed = _json.loads(result)
+    assert "error" in parsed
+    assert agent._memory_manager.handle_tool_call.call_count == 0
+    assert captured.get("action") == "remove"
+
+
+def test_invoke_tool_brv_curate_blocked(monkeypatch):
+    """brv_curate is a ByteRover write — round-1 suffix logic would miss it."""
+    from unittest.mock import patch, MagicMock
+    import json as _json
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value="should_not_be_called")
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", return_value="BLOCKED brv"):
+        result = agent._invoke_tool(
+            "brv_curate",
+            {"content": "secret payload"},
+            effective_task_id="task-brv-1",
+        )
+
+    parsed = _json.loads(result)
+    assert "error" in parsed
+    assert agent._memory_manager.handle_tool_call.call_count == 0
+
+
+def test_invoke_tool_viking_add_resource_blocked(monkeypatch):
+    """viking_add_resource POSTs a new resource — round-1 missed it."""
+    from unittest.mock import patch, MagicMock
+    import json as _json
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value="should_not_be_called")
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", return_value="BLOCKED viking"):
+        result = agent._invoke_tool(
+            "viking_add_resource",
+            {"url": "https://leak.example.com/data.json"},
+            effective_task_id="task-viking-1",
+        )
+
+    parsed = _json.loads(result)
+    assert "error" in parsed
+    assert agent._memory_manager.handle_tool_call.call_count == 0
+
+
+def test_invoke_tool_retaindb_upload_file_blocked(monkeypatch):
+    """retaindb_upload_file writes to file store — must be gated."""
+    from unittest.mock import patch, MagicMock
+    import json as _json
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value="should_not_be_called")
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", return_value="BLOCKED retain"):
+        result = agent._invoke_tool(
+            "retaindb_upload_file",
+            {"local_path": "/tmp/secret.txt", "remote_path": "/leaked.txt"},
+            effective_task_id="task-retain-1",
+        )
+
+    parsed = _json.loads(result)
+    assert "error" in parsed
+    assert agent._memory_manager.handle_tool_call.call_count == 0
+
+
+def test_invoke_tool_retaindb_delete_file_blocked(monkeypatch):
+    """retaindb_delete_file is a destructive op — must be gated."""
+    from unittest.mock import patch, MagicMock
+    import json as _json
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value="should_not_be_called")
+
+    captured = {}
+
+    def _block(action, **kwargs):
+        captured["action"] = action
+        return "BLOCKED retain rm" if action == "remove" else None
+
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", side_effect=_block):
+        result = agent._invoke_tool(
+            "retaindb_delete_file",
+            {"file_id": "rdb://abc"},
+            effective_task_id="task-retain-rm",
+        )
+
+    parsed = _json.loads(result)
+    assert "error" in parsed
+    assert agent._memory_manager.handle_tool_call.call_count == 0
+    assert captured.get("action") == "remove"
+
+
+def test_invoke_tool_known_read_skips_gate(monkeypatch):
+    """Sanity: read-only known tools still skip the gate (no regression)."""
+    from unittest.mock import patch, MagicMock
+
+    agent, _ = _build_test_agent(monkeypatch)
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.has_tool = MagicMock(return_value=True)
+    agent._memory_manager.handle_tool_call = MagicMock(return_value='{"results": []}')
+
+    gate_mock = MagicMock(return_value="should not be called")
+    with patch("hermes_cli.plugins.get_pre_memory_write_block_message", gate_mock):
+        agent._invoke_tool(
+            "mem0_search",
+            {"query": "anything"},
+            effective_task_id="task-read-mem0",
+        )
+        agent._invoke_tool(
+            "viking_browse",
+            {"action": "list", "path": "viking://resources/"},
+            effective_task_id="task-read-viking",
+        )
+
+    assert gate_mock.call_count == 0
+    assert agent._memory_manager.handle_tool_call.call_count == 2
