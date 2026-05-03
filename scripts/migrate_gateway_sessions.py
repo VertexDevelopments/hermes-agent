@@ -34,7 +34,18 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from hermes_constants import get_hermes_home
+# Round-7 M (codex round-6 MEDIUM, conf 0.98): direct execution via
+# ``python3 scripts/migrate_gateway_sessions.py`` puts ``scripts/`` on
+# ``sys.path``, NOT the repo root, so ``import hermes_constants`` fails
+# with ModuleNotFoundError on any interpreter that doesn't have the
+# editable-install .pth hook.  Bootstrap the repo root onto sys.path
+# before the import so the script is self-contained for direct
+# invocation, with no PYTHONPATH gymnastics required.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from hermes_constants import get_hermes_home  # noqa: E402  (after sys.path)
 
 
 def _default_db_path() -> Path:
