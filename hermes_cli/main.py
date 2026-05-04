@@ -5003,6 +5003,17 @@ def cmd_cron(args):
     cron_command(args)
 
 
+def cmd_maestro(args):
+    """Maestro orchestrator subcommands. Exits with the verb's return
+    code so non-zero rc (validation errors, dispatch errors) propagates
+    to shell. Hermes' top-level dispatch ignores func() return values."""
+    from hermes_cli.maestro import maestro_command
+
+    rc = maestro_command(args)
+    if rc:
+        sys.exit(rc)
+
+
 def cmd_webhook(args):
     """Webhook subscription management."""
     from hermes_cli.webhook import webhook_command
@@ -7561,6 +7572,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "auth",
         "status",
         "cron",
+        "maestro",
         "doctor",
         "config",
         "pairing",
@@ -8614,6 +8626,12 @@ def main():
     _add_accept_hooks_flag(cron_tick)
     _add_accept_hooks_flag(cron_parser)
     cron_parser.set_defaults(func=cmd_cron)
+
+    # =========================================================================
+    # maestro command
+    # =========================================================================
+    from hermes_cli.maestro import register as register_maestro
+    register_maestro(subparsers, dispatch=cmd_maestro)
 
     # =========================================================================
     # webhook command
