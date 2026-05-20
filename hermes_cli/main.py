@@ -8761,6 +8761,19 @@ def main():
     doctor_parser.set_defaults(func=cmd_doctor)
 
     # =========================================================================
+    # maestro command — bridge to Hermes-Zen-Agent's vendored maestro.cli
+    # See docs/upstream-patches/hermes-cli-maestro-bridge.md in
+    # Hermes-Zen-Agent for the upstream patch this mirrors.
+    # =========================================================================
+    try:
+        from hermes_cli.maestro_bridge import register_maestro_subparser
+        register_maestro_subparser(subparsers)
+    except Exception as _exc:
+        logging.getLogger(__name__).debug(
+            "maestro bridge not registered: %s", _exc,
+        )
+
+    # =========================================================================
     # dump command
     # =========================================================================
     dump_parser = subparsers.add_parser(
