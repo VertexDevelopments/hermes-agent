@@ -30,6 +30,7 @@ EXCLUDED_SKILL_DIRS = frozenset(
         ".github",
         ".hub",
         ".archive",
+        ".pending",
         ".venv",
         "venv",
         "node_modules",
@@ -59,7 +60,12 @@ def is_excluded_skill_path(path) -> bool:
     except AttributeError:
         from pathlib import PurePath
         parts = PurePath(str(path)).parts
-    return any(part in EXCLUDED_SKILL_DIRS for part in parts)
+    if any(part in EXCLUDED_SKILL_DIRS for part in parts):
+        return True
+    # Validation suites may contain fixture SKILL.md files under a skill's
+    # tests/ directory. Do not treat those as skills, but allow a legitimate
+    # top-level/category named "tests" (e.g. tests/my-skill/SKILL.md).
+    return len(parts) >= 2 and parts[-2] == "tests" and parts[-1] == "SKILL.md"
 
 
 # ── Lazy YAML loader ─────────────────────────────────────────────────────
@@ -532,14 +538,23 @@ def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
 def iter_skill_index_files(skills_dir: Path, filename: str):
     """Walk skills_dir yielding sorted paths matching *filename*.
 
-    Excludes Hermes metadata, VCS, virtualenv/dependency, and cache
-    directories so dependencies cannot register nested skills.
+    Excludes Hermes metadata, VCS, virtualenv/dependency, cache directories,
+    and validation fixture directories under actual skills.
     """
     matches = []
     for root, dirs, files in os.walk(skills_dir, followlinks=True):
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS]
+        # If this directory is itself a skill, its tests/ subdirectory is
+        # validation scaffolding, not a nested skill catalog. Keep a top-level
+        # or category directory named "tests" working by pruning only below an
+        # actual skill root (identified by a sibling SKILL.md).
+        excluded = {str(d) for d in EXCLUDED_SKILL_DIRS}
         if filename in files:
-            matches.append(Path(root) / filename)
+            excluded.add("tests")
+        dirs[:] = [d for d in dirs if d not in excluded]
+        if filename in files:
+            candidate = Path(root) / filename
+            if not is_excluded_skill_path(candidate):
+                matches.append(candidate)
     for path in sorted(matches, key=lambda p: str(p.relative_to(skills_dir))):
         yield path
 

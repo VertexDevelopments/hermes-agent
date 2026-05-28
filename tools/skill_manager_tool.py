@@ -569,11 +569,14 @@ def _patch_skill(
     new_string: str,
     file_path: str = None,
     replace_all: bool = False,
+    validate: bool = False,
+    validation_mode: str = None,
 ) -> Dict[str, Any]:
     """Targeted find-and-replace within a skill file.
 
     Defaults to SKILL.md. Use file_path to patch a supporting file instead.
-    Requires a unique match unless replace_all is True.
+    Requires a unique match unless replace_all is True. Validation is opt-in
+    and never changes legacy behavior when validate=False.
     """
     if not old_string:
         return {"success": False, "error": "old_string is required for 'patch'."}
@@ -603,22 +606,18 @@ def _patch_skill(
 
     content = target.read_text(encoding="utf-8")
 
-    # Use the same fuzzy matching engine as the file patch tool.
-    # This handles whitespace normalization, indentation differences,
-    # escape sequences, and block-anchor matching — saving the agent
-    # from exact-match failures on minor formatting mismatches.
-    from tools.fuzzy_match import fuzzy_find_and_replace
+    # Compute the patch exactly once. Validation and the eventual write both
+    # use this PatchComputation so fuzzy matching cannot drift between stages.
+    from tools.skill_patch_utils import compute_patch, sha256_text
 
-    new_content, match_count, _strategy, match_error = fuzzy_find_and_replace(
-        content, old_string, new_string, replace_all
-    )
-    if match_error:
+    patch = compute_patch(content, old_string, new_string, replace_all)
+    if patch.error:
         # Show a short preview of the file so the model can self-correct
         preview = content[:500] + ("..." if len(content) > 500 else "")
-        err_msg = match_error
+        err_msg = patch.error
         try:
             from tools.fuzzy_match import format_no_match_hint
-            err_msg += format_no_match_hint(match_error, match_count, old_string, content)
+            err_msg += format_no_match_hint(patch.error, patch.match_count, old_string, content)
         except Exception:
             pass
         return {
@@ -627,19 +626,80 @@ def _patch_skill(
             "file_preview": preview,
         }
 
-    # Check size limit on the result
+    new_content = patch.patched_content
+    match_count = patch.match_count
+
+    # Check size limit on the result before validation or write.
     target_label = "SKILL.md" if not file_path else file_path
     err = _validate_content_size(new_content, label=target_label)
     if err:
         return {"success": False, "error": err}
 
-    # If patching SKILL.md, validate frontmatter is still intact
+    # If patching SKILL.md, validate frontmatter is structurally intact. The
+    # optional validator may further block protected frontmatter mutations.
     if not file_path:
         err = _validate_frontmatter(new_content)
         if err:
             return {
                 "success": False,
                 "error": f"Patch would break SKILL.md structure: {err}",
+            }
+
+    validation_payload = None
+    if validate:
+        try:
+            from tools import skill_validator
+
+            validation_result = skill_validator.validate_skill_patch(
+                skill_name=name,
+                skill_dir=skill_dir,
+                target=target,
+                patch=patch,
+                mode=validation_mode,
+            )
+            validation_payload = validation_result.to_dict()
+            if validation_result.safety_failure or validation_result.status == "rejected":
+                return {
+                    "success": False,
+                    "error": validation_result.reason,
+                    "validation": validation_payload,
+                }
+        except Exception as e:
+            fail_open = False
+            try:
+                from tools.skill_validator import load_validation_config
+                fail_open = is_truthy_value(load_validation_config().get("fail_open"), default=False)
+            except Exception:
+                fail_open = False
+            validation_payload = {
+                "status": "error_fail_open" if fail_open else "error",
+                "mode": validation_mode or "warn",
+                "score": 0.0,
+                "safety_failure": not fail_open,
+                "test_results": [],
+                "failed_tests": [],
+                "warnings": [str(e)] if fail_open else [],
+                "reason": f"validator crashed: {e}",
+            }
+            if not fail_open:
+                return {
+                    "success": False,
+                    "error": validation_payload["reason"],
+                    "validation": validation_payload,
+                }
+
+        current_content = target.read_text(encoding="utf-8")
+        if sha256_text(current_content) != patch.original_sha256:
+            validation_payload = validation_payload or {}
+            validation_payload.update({
+                "status": "rejected",
+                "safety_failure": True,
+                "reason": "target changed after validation",
+            })
+            return {
+                "success": False,
+                "error": "Target changed after validation; re-read and retry the patch.",
+                "validation": validation_payload,
             }
 
     original_content = content  # for rollback
@@ -649,12 +709,18 @@ def _patch_skill(
     scan_error = _security_scan_skill(skill_dir)
     if scan_error:
         _atomic_write_text(target, original_content)
-        return {"success": False, "error": scan_error}
+        result = {"success": False, "error": scan_error}
+        if validation_payload is not None:
+            result["validation"] = validation_payload
+        return result
 
-    return {
+    result = {
         "success": True,
         "message": f"Patched {'SKILL.md' if not file_path else file_path} in skill '{name}' ({match_count} replacement{'s' if match_count > 1 else ''}).",
     }
+    if validation_payload is not None:
+        result["validation"] = validation_payload
+    return result
 
 
 def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, Any]:
@@ -824,6 +890,8 @@ def skill_manage(
     new_string: str = None,
     replace_all: bool = False,
     absorbed_into: str = None,
+    validate: bool = False,
+    validation_mode: str = None,
 ) -> str:
     """
     Manage user-created skills. Dispatches to the appropriate action handler.
@@ -845,7 +913,15 @@ def skill_manage(
             return tool_error("old_string is required for 'patch'. Provide the text to find.", success=False)
         if new_string is None:
             return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
-        result = _patch_skill(name, old_string, new_string, file_path, replace_all)
+        result = _patch_skill(
+            name,
+            old_string,
+            new_string,
+            file_path,
+            replace_all,
+            validate=validate,
+            validation_mode=validation_mode,
+        )
 
     elif action == "delete":
         result = _delete_skill(name, absorbed_into=absorbed_into)
@@ -971,6 +1047,21 @@ SKILL_MANAGE_SCHEMA = {
                 "type": "boolean",
                 "description": "For 'patch': replace all occurrences instead of requiring a unique match (default: false)."
             },
+            "validate": {
+                "type": "boolean",
+                "description": (
+                    "For 'patch' only. Opt in to skill validation/verification. "
+                    "Default false to preserve existing behavior."
+                ),
+            },
+            "validation_mode": {
+                "type": "string",
+                "enum": ["warn", "blocking"],
+                "description": (
+                    "For 'patch' validation only. warn applies safe patches and returns "
+                    "warnings for failed tests; blocking rejects failed validation."
+                ),
+            },
             "category": {
                 "type": "string",
                 "description": (
@@ -1029,6 +1120,8 @@ registry.register(
         old_string=args.get("old_string"),
         new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False),
-        absorbed_into=args.get("absorbed_into")),
+        absorbed_into=args.get("absorbed_into"),
+        validate=args.get("validate", False),
+        validation_mode=args.get("validation_mode")),
     emoji="📝",
 )

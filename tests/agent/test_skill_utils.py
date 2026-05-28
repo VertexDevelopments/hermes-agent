@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from agent.skill_utils import (
     extract_skill_conditions,
+    is_excluded_skill_path,
     iter_skill_index_files,
     skill_matches_platform,
 )
@@ -62,6 +63,28 @@ def test_metadata_missing_entirely():
         "fallback_for_tools": [],
         "requires_tools": [],
     }
+
+
+def test_validation_scaffolding_paths_are_excluded_without_hiding_tests_category(tmp_path):
+    assert is_excluded_skill_path(tmp_path / ".pending" / "abc.json") is True
+    assert is_excluded_skill_path(tmp_path / "some-skill" / "tests" / "SKILL.md") is True
+    assert is_excluded_skill_path(tmp_path / "tests" / "legit-skill" / "SKILL.md") is False
+
+
+def test_iter_skill_index_files_skips_skill_validation_tests_but_keeps_tests_category(tmp_path):
+    real = tmp_path / "some-skill"
+    real.mkdir()
+    (real / "SKILL.md").write_text("---\nname: some-skill\n---\n", encoding="utf-8")
+    fixture = real / "tests"
+    fixture.mkdir()
+    (fixture / "SKILL.md").write_text("---\nname: fixture\n---\n", encoding="utf-8")
+    tests_category_skill = tmp_path / "tests" / "legit-skill"
+    tests_category_skill.mkdir(parents=True)
+    (tests_category_skill / "SKILL.md").write_text("---\nname: legit-skill\n---\n", encoding="utf-8")
+
+    found = [p.relative_to(tmp_path).as_posix() for p in iter_skill_index_files(tmp_path, "SKILL.md")]
+
+    assert found == ["some-skill/SKILL.md", "tests/legit-skill/SKILL.md"]
 
 
 def test_iter_skill_index_files_prunes_dependency_dirs(tmp_path):
