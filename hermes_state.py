@@ -172,6 +172,12 @@ def apply_wal_with_fallback(
     """
     # Read-only probe — no flock, no checkpoint, no WAL/SHM unlink.
     # Skipping the set-pragma prevents WAL-init from unlinking files other connections hold open.
+    # StartiaOS hardening: concurrent writers WAIT for the lock instead of
+    # erroring under write contention (additive to upstream WAL handling).
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+    except sqlite3.OperationalError:
+        pass
     try:
         current_mode = conn.execute("PRAGMA journal_mode").fetchone()
         if current_mode and current_mode[0] == "wal":
