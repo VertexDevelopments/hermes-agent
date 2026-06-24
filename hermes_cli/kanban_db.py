@@ -4478,6 +4478,9 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+RECOMPUTE_PROMOTE_CAP = 5  # max circuit-breaker auto-recoveries before a blocked card stops being revived (crash-loop bound 2026-06-02)
+
+
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     """Return the durable phase a blocked/dependency-wait task should resume.
 
@@ -4565,6 +4568,23 @@ def recompute_ready(
             if all(p["status"] in ("done", "archived") for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
+                    # Redispatch cap (crash-loop bound, 2026-06-02): even though
+                    # v0.17 preserves consecutive_failures across recovery cycles,
+                    # keep an absolute cap on total auto-recoveries so a card looping
+                    # on a broken lane (t_23531e5d revived ~20x in the 06-02 grok43
+                    # incident) eventually stops being revived. Additive on top of the
+                    # failure-limit breaker below; try/except so the cap can only ADD
+                    # a skip, never break promotion.
+                    try:
+                        _promote_n = conn.execute(
+                            "SELECT COUNT(*) FROM task_events "
+                            "WHERE task_id = ? AND kind = 'promoted'",
+                            (task_id,),
+                        ).fetchone()[0]
+                        if _promote_n >= RECOMPUTE_PROMOTE_CAP:
+                            continue
+                    except Exception:
+                        pass
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
                     # guard, a task that repeatedly exhausts its
