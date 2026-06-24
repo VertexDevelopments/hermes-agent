@@ -1076,6 +1076,23 @@ class GatewayKanbanWatchersMixin:
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
         while self._running:
+            # H2: dispatcher heartbeat. The kanban dispatcher spawns workers
+            # WITHOUT holding cron/.tick.lock, so the external watchdog's
+            # tick_in_flight signal is blind to it and false-restarted this
+            # healthy-but-quiet gateway, mass-killing workers spawned during the
+            # SIGTERM drain (4 batches / 17 workers, 0 recovered, 2026-06-05).
+            # Written at loop top each iteration so a fresh mtime means the loop
+            # is alive; a hang anywhere below leaves it stale -> watchdog restarts
+            # correctly. get_hermes_home() is override-aware -> resolves to the
+            # profile home at runtime (matches watchdog PROFILE_HOME). A heartbeat
+            # write must NEVER break dispatch.
+            try:
+                from hermes_constants import get_hermes_home as _ghh
+                _hb = _ghh() / "cron" / ".dispatch.heartbeat"
+                _hb.parent.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(_hb.write_text, str(time.time()))
+            except Exception:
+                logger.debug("kanban dispatcher: heartbeat write failed", exc_info=True)
             try:
                 # Reap zombie children before per-board work so a board DB
                 # failure cannot block cleanup of unrelated workers.
