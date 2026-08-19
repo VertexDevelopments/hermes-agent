@@ -10134,6 +10134,12 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
+        if (max_in_progress is not None and not dry_run
+                and count_running_tasks(conn)
+                + count_running_tasks_other_boards(board) >= max_in_progress):
+            # Fresh recount: a concurrent dispatcher (manual CLI vs gateway
+            # tick) may have claimed since this tick counted in_progress.
+            break
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -10338,6 +10344,12 @@ def _dispatch_once_locked(
     # grant the review lane extra capacity.
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
+            break
+        if (max_in_progress is not None and not dry_run
+                and count_running_tasks(conn)
+                + count_running_tasks_other_boards(board) >= max_in_progress):
+            # Fresh recount: a concurrent dispatcher (manual CLI vs gateway
+            # tick) may have claimed since this tick counted in_progress.
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
